@@ -1,9 +1,6 @@
 """Tests for ClaudeSDKClient streaming functionality and query() with async iterables."""
 
 import json
-import sys
-import tempfile
-from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -20,7 +17,6 @@ from claude_agent_sdk import (
     UserMessage,
     query,
 )
-from claude_agent_sdk._internal.transport.subprocess_cli import SubprocessCLITransport
 
 
 def create_mock_transport(with_init_response=True):
@@ -1001,108 +997,51 @@ class TestQueryWithAsyncIterable:
 
     @pytest.mark.anyio
     async def test_query_with_async_iterable(self):
-        """Test query with async iterable of messages."""
+        """Test query streams each message of an async iterable to the transport."""
 
         async def message_stream():
             yield {"type": "user", "message": {"role": "user", "content": "First"}}
             yield {"type": "user", "message": {"role": "user", "content": "Second"}}
 
-        # Create a simple test script that validates stdin and outputs a result
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
-            test_script = f.name
-            f.write("""#!/usr/bin/env python3
-import sys
-import json
+        written: list[str] = []
 
-# Read stdin messages
-stdin_messages = []
-while True:
-    line = sys.stdin.readline()
-    if not line:
-        break
+        mock_transport = create_mock_transport(with_init_response=False)
 
-    try:
-        msg = json.loads(line.strip())
-        # Handle control requests
-        if msg.get("type") == "control_request":
-            request_id = msg.get("request_id")
-            request = msg.get("request", {})
+        async def capture_write(data):
+            written.append(data)
 
-            # Send control response for initialize
-            if request.get("subtype") == "initialize":
-                response = {
-                    "type": "control_response",
-                    "response": {
-                        "subtype": "success",
-                        "request_id": request_id,
-                        "response": {
-                            "commands": [],
-                            "output_style": "default"
-                        }
-                    }
-                }
-                print(json.dumps(response))
-                sys.stdout.flush()
-        else:
-            stdin_messages.append(line.strip())
-    except:
-        stdin_messages.append(line.strip())
+        mock_transport.write.side_effect = capture_write
 
-# Verify we got 2 user messages
-assert len(stdin_messages) == 2
-assert '"First"' in stdin_messages[0]
-assert '"Second"' in stdin_messages[1]
+        async def mock_receive():
+            yield {
+                "type": "result",
+                "subtype": "success",
+                "duration_ms": 100,
+                "duration_api_ms": 50,
+                "is_error": False,
+                "num_turns": 1,
+                "session_id": "test",
+                "total_cost_usd": 0.001,
+            }
 
-# Output a valid result
-print('{"type": "result", "subtype": "success", "duration_ms": 100, "duration_api_ms": 50, "is_error": false, "num_turns": 1, "session_id": "test", "total_cost_usd": 0.001}')
-""")
+        mock_transport.read_messages = mock_receive
 
-        # Make script executable (Unix-style systems)
-        if sys.platform != "win32":
-            Path(test_script).chmod(0o755)
+        with patch(
+            "claude_agent_sdk._internal.query.Query.initialize",
+            new_callable=AsyncMock,
+        ):
+            messages = []
+            async for msg in query(prompt=message_stream(), transport=mock_transport):
+                messages.append(msg)
 
-        try:
-            # Mock _find_cli to return the test script path directly
-            with patch.object(
-                SubprocessCLITransport, "_find_cli", return_value=test_script
-            ):
-                # Mock _build_command to properly execute Python script
-                original_build_command = SubprocessCLITransport._build_command
+        # The single result message is surfaced.
+        assert len(messages) == 1
+        assert isinstance(messages[0], ResultMessage)
+        assert messages[0].subtype == "success"
 
-                def mock_build_command(self):
-                    # Get original command
-                    cmd = original_build_command(self)
-                    # On Windows, we need to use python interpreter to run the script
-                    if sys.platform == "win32":
-                        # Replace first element with python interpreter and script
-                        cmd[0:1] = [sys.executable, test_script]
-                    else:
-                        # On Unix, just use the script directly
-                        cmd[0] = test_script
-                    return cmd
-
-                with patch.object(
-                    SubprocessCLITransport, "_build_command", mock_build_command
-                ):
-                    # This test exercises the stream-json pipe protocol over
-                    # stdin, so use SubprocessCLITransport explicitly rather
-                    # than the default (PTY) transport.
-                    stream = message_stream()
-                    transport = SubprocessCLITransport(
-                        prompt=stream, options=ClaudeAgentOptions()
-                    )
-                    # Run query with async iterable
-                    messages = []
-                    async for msg in query(prompt=stream, transport=transport):
-                        messages.append(msg)
-
-                    # Should get the result message
-                    assert len(messages) == 1
-                    assert isinstance(messages[0], ResultMessage)
-                    assert messages[0].subtype == "success"
-        finally:
-            # Clean up
-            Path(test_script).unlink()
+        # Both user messages from the async iterable were streamed to the transport.
+        assert any('"First"' in w for w in written)
+        assert any('"Second"' in w for w in written)
 
 
 class TestClaudeSDKClientEdgeCases:

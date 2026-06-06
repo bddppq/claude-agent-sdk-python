@@ -1,9 +1,8 @@
 """PTY-based transport that drives the Claude Code CLI in interactive mode.
 
-Unlike :class:`SubprocessCLITransport`, which speaks the bidirectional
-``stream-json`` protocol over plain pipes (and historically ``--print``), this
-transport launches the *interactive* CLI attached to a pseudo-terminal (PTY).
-It then:
+This is the SDK's transport. Rather than speaking the headless ``stream-json``
+protocol over pipes (the former ``--print`` mode), it launches the
+*interactive* CLI attached to a pseudo-terminal (PTY). It then:
 
 * types user prompts into the PTY (as a real terminal would), and
 * reads the model's responses by **tailing the session transcript** the CLI
@@ -29,7 +28,6 @@ import time
 import tty
 import uuid
 from collections.abc import AsyncIterable, AsyncIterator
-from dataclasses import replace
 from pathlib import Path
 from subprocess import Popen
 from typing import Any
@@ -37,12 +35,10 @@ from typing import Any
 import anyio
 
 from ..._errors import CLIConnectionError, CLINotFoundError
-from ..._version import __version__
 from ...types import ClaudeAgentOptions
 from .._task_compat import TaskHandle, spawn_detached
 from ..sessions import _canonicalize_path, _get_projects_dir, _sanitize_path
-from . import Transport
-from .subprocess_cli import SubprocessCLITransport
+from . import Transport, _cli_command
 
 logger = logging.getLogger(__name__)
 
@@ -62,9 +58,24 @@ _SKIP_TRANSCRIPT_TYPES = frozenset(
 )
 
 # Keystrokes sent into the PTY. A bare carriage return submits the current
-# prompt in the TUI; ESC interrupts an in-progress turn.
+# prompt in the TUI; ESC interrupts an in-progress turn (app:interrupt);
+# shift+tab (CSI Z, "back-tab") cycles the permission mode (chat:cycleMode).
 _SUBMIT = b"\r"
 _INTERRUPT = b"\x1b"
+_SHIFT_TAB = b"\x1b[Z"
+
+# Order the TUI cycles through on shift+tab. bypassPermissions is not part of
+# the cycle (it is only reachable via launch flag), so it cannot be set live.
+_PERMISSION_CYCLE = ("default", "acceptEdits", "plan")
+
+# Control-request subtypes whose interactive equivalent is simply running a
+# slash command in the TUI. These surface information in the TUI rather than
+# returning structured data to the SDK.
+_SLASH_COMMAND_CONTROLS = {
+    "mcp_status": "/mcp",
+    "get_context_usage": "/context",
+    "rewind_files": "/rewind",
+}
 
 
 def _translate_transcript_entry(
@@ -166,6 +177,9 @@ class PtyCLITransport(Transport):
         )
         self._cwd = str(options.cwd) if options.cwd else str(Path.cwd())
         self._session_id = options.session_id or str(uuid.uuid4())
+        # Track the live permission mode so set_permission_mode can compute how
+        # many shift+tab cycles are needed to reach a target.
+        self._permission_mode: str = options.permission_mode or "default"
 
         self._proc: Popen[bytes] | None = None
         self._master_fd: int | None = None
@@ -195,7 +209,10 @@ class PtyCLITransport(Transport):
             return
 
         if self._cli_path is None:
-            self._cli_path = await anyio.to_thread.run_sync(self._find_cli)
+            self._cli_path = await anyio.to_thread.run_sync(_cli_command.find_cli)
+
+        if not os.environ.get("CLAUDE_AGENT_SDK_SKIP_VERSION_CHECK"):
+            await _cli_command.check_claude_version(self._cli_path)
 
         # Interactive mode shows first-run onboarding (theme/login) screens that
         # block programmatic input. Mark onboarding complete so the CLI drops
@@ -265,28 +282,8 @@ class PtyCLITransport(Transport):
             }
         )
 
-    def _find_cli(self) -> str:
-        # Reuse the well-tested discovery logic from the pipe transport.
-        return SubprocessCLITransport(prompt="", options=self._options)._find_cli()
-
     def _build_env(self) -> dict[str, str]:
-        # Filter CLAUDECODE so the child does not believe it is nested inside a
-        # parent Claude Code (see subprocess_cli for rationale).
-        inherited = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
-        env = {
-            **inherited,
-            "CLAUDE_CODE_ENTRYPOINT": "sdk-py-pty",
-            **self._options.env,
-            "CLAUDE_AGENT_SDK_VERSION": __version__,
-        }
-        env["PWD"] = self._cwd
-        # Running as root, the CLI refuses bypassPermissions /
-        # --dangerously-skip-permissions unless IS_SANDBOX marks a contained
-        # environment. The CLI only accepts the exact value "1", so normalize
-        # any inherited value (e.g. "yes") unless the caller set one explicitly.
-        if hasattr(os, "geteuid") and os.geteuid() == 0:
-            env["IS_SANDBOX"] = self._options.env.get("IS_SANDBOX", "1")
-        return env
+        return _cli_command.build_env(self._options, self._cwd, entrypoint="sdk-py-pty")
 
     def _ensure_onboarding_complete(self) -> None:
         """Clear interactive gates that would block programmatic input.
@@ -341,43 +338,12 @@ class PtyCLITransport(Transport):
             logger.debug("Could not update CLI config flags", exc_info=True)
 
     def _build_command(self) -> list[str]:
-        """Build the interactive CLI command.
-
-        Reuses :meth:`SubprocessCLITransport._build_command` for full option
-        coverage, then strips the ``stream-json`` I/O flags that only apply to
-        the headless protocol so the CLI starts its interactive TUI instead.
-        """
+        """Build the interactive CLI command from the configured options."""
         if self._cli_path is None:
             raise CLINotFoundError("CLI path not resolved. Call connect() first.")
-
-        # Ensure a known session id so we can locate the transcript file.
-        opts = self._options
-        if not opts.session_id:
-            opts = replace(opts, session_id=self._session_id)
-        helper = SubprocessCLITransport(prompt="", options=opts)
-        helper._cli_path = self._cli_path
-        raw = helper._build_command()
-
-        drop_with_value = {"--output-format", "--input-format"}
-        drop_flag = {
-            "--verbose",
-            "--include-partial-messages",
-            "--include-hook-events",
-            "--session-mirror",
-        }
-        cmd: list[str] = []
-        skip_next = False
-        for tok in raw:
-            if skip_next:
-                skip_next = False
-                continue
-            if tok in drop_with_value:
-                skip_next = True
-                continue
-            if tok in drop_flag:
-                continue
-            cmd.append(tok)
-        return cmd
+        return _cli_command.build_command(
+            self._cli_path, self._options, self._session_id
+        )
 
     def _compute_transcript_path(self) -> Path:
         project_dir = _get_projects_dir(
@@ -549,15 +515,37 @@ class PtyCLITransport(Transport):
             # Other frame types have no interactive equivalent; ignore them.
 
     async def _handle_control_request(self, obj: dict[str, Any]) -> None:
+        """Map an SDK control request to its interactive-TUI equivalent.
+
+        The interactive CLI does not speak the SDK control protocol, but every
+        control operation has a keystroke or slash-command equivalent:
+
+        * ``initialize`` -- no-op (acknowledged locally).
+        * ``interrupt`` -- ESC.
+        * ``set_permission_mode`` -- shift+tab cycles to the target mode.
+        * ``set_model`` -- the ``/model`` slash command.
+        * ``mcp_status`` / ``get_context_usage`` / ``rewind_files`` -- the
+          ``/mcp`` / ``/context`` / ``/rewind`` slash commands.
+
+        Every request is then acknowledged so the SDK handshake proceeds.
+        """
         request = obj.get("request", {})
         subtype = request.get("subtype")
         request_id = obj.get("request_id")
 
-        if subtype == "interrupt":
-            await self._pty_write(_INTERRUPT)
+        try:
+            if subtype == "interrupt":
+                await self._pty_write(_INTERRUPT)
+            elif subtype == "set_permission_mode":
+                await self._set_permission_mode(request.get("mode"))
+            elif subtype == "set_model":
+                await self._set_model(request.get("model"))
+            elif subtype in _SLASH_COMMAND_CONTROLS:
+                await self._run_slash_command(_SLASH_COMMAND_CONTROLS[subtype])
+            # initialize and any other subtypes need no interactive action.
+        except Exception:
+            logger.debug("Interactive control action failed", exc_info=True)
 
-        # The interactive CLI does not speak the SDK control protocol, so we
-        # acknowledge control requests locally to keep the handshake flowing.
         response = {
             "type": "control_response",
             "response": {
@@ -571,6 +559,39 @@ class PtyCLITransport(Transport):
                 anyio.BrokenResourceError, anyio.ClosedResourceError
             ):
                 await self._out_send.send(response)
+
+    async def _set_permission_mode(self, mode: str | None) -> None:
+        """Cycle the TUI permission mode to ``mode`` via shift+tab."""
+        if mode is None or mode == self._permission_mode:
+            return
+        if (
+            mode not in _PERMISSION_CYCLE
+            or self._permission_mode not in _PERMISSION_CYCLE
+        ):
+            # bypassPermissions (or an unknown current mode) is not reachable by
+            # cycling; it can only be set via the launch flag.
+            logger.debug("Cannot reach permission mode %r by cycling", mode)
+            return
+        await self._warmup()
+        current = _PERMISSION_CYCLE.index(self._permission_mode)
+        target = _PERMISSION_CYCLE.index(mode)
+        steps = (target - current) % len(_PERMISSION_CYCLE)
+        for _ in range(steps):
+            await self._pty_write(_SHIFT_TAB)
+            await anyio.sleep(0.1)
+        self._permission_mode = mode
+
+    async def _set_model(self, model: str | None) -> None:
+        """Switch the model via the ``/model`` slash command."""
+        if not model:
+            return
+        await self._run_slash_command(f"/model {model}")
+
+    async def _run_slash_command(self, command: str) -> None:
+        await self._warmup()
+        await self._pty_write(command.encode("utf-8"))
+        await anyio.sleep(0.2)
+        await self._pty_write(_SUBMIT)
 
     async def _handle_user_message(self, obj: dict[str, Any]) -> None:
         message = obj.get("message", {})
