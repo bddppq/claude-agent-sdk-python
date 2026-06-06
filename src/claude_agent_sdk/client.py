@@ -154,7 +154,7 @@ class ClaudeSDKClient:
             apply_materialized_options,
             build_mirror_batcher,
         )
-        from ._internal.transport.subprocess_cli import SubprocessCLITransport
+        from ._internal.transport.pty_cli import PtyCLITransport
 
         # Validate and configure permission settings (matching TypeScript SDK logic)
         if self.options.can_use_tool:
@@ -184,7 +184,7 @@ class ClaudeSDKClient:
         if self._custom_transport:
             self._transport = self._custom_transport
         else:
-            self._transport = SubprocessCLITransport(
+            self._transport = PtyCLITransport(
                 prompt=actual_prompt,
                 options=options,
             )

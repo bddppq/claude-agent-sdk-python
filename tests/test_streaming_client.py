@@ -163,7 +163,7 @@ class TestClaudeSDKClientStreaming:
         """Test automatic connection when using context manager."""
 
         with patch(
-            "claude_agent_sdk._internal.transport.subprocess_cli.SubprocessCLITransport"
+            "claude_agent_sdk._internal.transport.pty_cli.PtyCLITransport"
         ) as mock_transport_class:
             mock_transport = create_mock_transport()
             mock_transport_class.return_value = mock_transport
@@ -181,7 +181,7 @@ class TestClaudeSDKClientStreaming:
         """Test manual connect and disconnect."""
 
         with patch(
-            "claude_agent_sdk._internal.transport.subprocess_cli.SubprocessCLITransport"
+            "claude_agent_sdk._internal.transport.pty_cli.PtyCLITransport"
         ) as mock_transport_class:
             mock_transport = create_mock_transport()
             mock_transport_class.return_value = mock_transport
@@ -203,7 +203,7 @@ class TestClaudeSDKClientStreaming:
         """Test connecting with a string prompt writes it as a user message."""
 
         with patch(
-            "claude_agent_sdk._internal.transport.subprocess_cli.SubprocessCLITransport"
+            "claude_agent_sdk._internal.transport.pty_cli.PtyCLITransport"
         ) as mock_transport_class:
             mock_transport = create_mock_transport()
             mock_transport_class.return_value = mock_transport
@@ -228,7 +228,7 @@ class TestClaudeSDKClientStreaming:
         """Test connecting with an async iterable."""
 
         with patch(
-            "claude_agent_sdk._internal.transport.subprocess_cli.SubprocessCLITransport"
+            "claude_agent_sdk._internal.transport.pty_cli.PtyCLITransport"
         ) as mock_transport_class:
             mock_transport = create_mock_transport()
             mock_transport_class.return_value = mock_transport
@@ -254,7 +254,7 @@ class TestClaudeSDKClientStreaming:
         """Test sending a query."""
 
         with patch(
-            "claude_agent_sdk._internal.transport.subprocess_cli.SubprocessCLITransport"
+            "claude_agent_sdk._internal.transport.pty_cli.PtyCLITransport"
         ) as mock_transport_class:
             mock_transport = create_mock_transport()
             mock_transport_class.return_value = mock_transport
@@ -286,7 +286,7 @@ class TestClaudeSDKClientStreaming:
         """Test sending a message with custom session ID."""
 
         with patch(
-            "claude_agent_sdk._internal.transport.subprocess_cli.SubprocessCLITransport"
+            "claude_agent_sdk._internal.transport.pty_cli.PtyCLITransport"
         ) as mock_transport_class:
             mock_transport = create_mock_transport()
             mock_transport_class.return_value = mock_transport
@@ -321,7 +321,7 @@ class TestClaudeSDKClientStreaming:
         """Test receiving messages."""
 
         with patch(
-            "claude_agent_sdk._internal.transport.subprocess_cli.SubprocessCLITransport"
+            "claude_agent_sdk._internal.transport.pty_cli.PtyCLITransport"
         ) as mock_transport_class:
             mock_transport = create_mock_transport()
             mock_transport_class.return_value = mock_transport
@@ -387,7 +387,7 @@ class TestClaudeSDKClientStreaming:
         """Test receive_response stops at ResultMessage."""
 
         with patch(
-            "claude_agent_sdk._internal.transport.subprocess_cli.SubprocessCLITransport"
+            "claude_agent_sdk._internal.transport.pty_cli.PtyCLITransport"
         ) as mock_transport_class:
             mock_transport = create_mock_transport()
             mock_transport_class.return_value = mock_transport
@@ -464,7 +464,7 @@ class TestClaudeSDKClientStreaming:
         """Test interrupt functionality."""
 
         with patch(
-            "claude_agent_sdk._internal.transport.subprocess_cli.SubprocessCLITransport"
+            "claude_agent_sdk._internal.transport.pty_cli.PtyCLITransport"
         ) as mock_transport_class:
             mock_transport = create_mock_transport()
             mock_transport_class.return_value = mock_transport
@@ -502,7 +502,7 @@ class TestClaudeSDKClientStreaming:
         """Test reconnect_mcp_server sends correct control request."""
 
         with patch(
-            "claude_agent_sdk._internal.transport.subprocess_cli.SubprocessCLITransport"
+            "claude_agent_sdk._internal.transport.pty_cli.PtyCLITransport"
         ) as mock_transport_class:
             mock_transport = _create_mock_transport_with_control_responses()
             mock_transport_class.return_value = mock_transport
@@ -542,7 +542,7 @@ class TestClaudeSDKClientStreaming:
         """Test toggle_mcp_server sends correct control request."""
 
         with patch(
-            "claude_agent_sdk._internal.transport.subprocess_cli.SubprocessCLITransport"
+            "claude_agent_sdk._internal.transport.pty_cli.PtyCLITransport"
         ) as mock_transport_class:
             mock_transport = _create_mock_transport_with_control_responses()
             mock_transport_class.return_value = mock_transport
@@ -575,7 +575,7 @@ class TestClaudeSDKClientStreaming:
         """Test toggle_mcp_server with enabled=True."""
 
         with patch(
-            "claude_agent_sdk._internal.transport.subprocess_cli.SubprocessCLITransport"
+            "claude_agent_sdk._internal.transport.pty_cli.PtyCLITransport"
         ) as mock_transport_class:
             mock_transport = _create_mock_transport_with_control_responses()
             mock_transport_class.return_value = mock_transport
@@ -614,7 +614,7 @@ class TestClaudeSDKClientStreaming:
         """Test stop_task sends correct control request with task_id."""
 
         with patch(
-            "claude_agent_sdk._internal.transport.subprocess_cli.SubprocessCLITransport"
+            "claude_agent_sdk._internal.transport.pty_cli.PtyCLITransport"
         ) as mock_transport_class:
             mock_transport = _create_mock_transport_with_control_responses()
             mock_transport_class.return_value = mock_transport
@@ -653,7 +653,7 @@ class TestClaudeSDKClientStreaming:
         """Test get_mcp_status returns McpStatusResponse shape."""
 
         with patch(
-            "claude_agent_sdk._internal.transport.subprocess_cli.SubprocessCLITransport"
+            "claude_agent_sdk._internal.transport.pty_cli.PtyCLITransport"
         ) as mock_transport_class:
             mock_transport = AsyncMock()
             mock_transport.connect = AsyncMock()
@@ -795,7 +795,7 @@ class TestClaudeSDKClientStreaming:
         """Test get_context_usage returns ContextUsageResponse shape."""
 
         with patch(
-            "claude_agent_sdk._internal.transport.subprocess_cli.SubprocessCLITransport"
+            "claude_agent_sdk._internal.transport.pty_cli.PtyCLITransport"
         ) as mock_transport_class:
             mock_transport = AsyncMock()
             mock_transport.connect = AsyncMock()
@@ -907,7 +907,7 @@ class TestClaudeSDKClientStreaming:
         )
 
         with patch(
-            "claude_agent_sdk._internal.transport.subprocess_cli.SubprocessCLITransport"
+            "claude_agent_sdk._internal.transport.pty_cli.PtyCLITransport"
         ) as mock_transport_class:
             mock_transport = create_mock_transport()
             mock_transport_class.return_value = mock_transport
@@ -924,7 +924,7 @@ class TestClaudeSDKClientStreaming:
         """Test concurrent sending and receiving messages."""
 
         with patch(
-            "claude_agent_sdk._internal.transport.subprocess_cli.SubprocessCLITransport"
+            "claude_agent_sdk._internal.transport.pty_cli.PtyCLITransport"
         ) as mock_transport_class:
             mock_transport = create_mock_transport()
             mock_transport_class.return_value = mock_transport
@@ -1084,9 +1084,16 @@ print('{"type": "result", "subtype": "success", "duration_ms": 100, "duration_ap
                 with patch.object(
                     SubprocessCLITransport, "_build_command", mock_build_command
                 ):
+                    # This test exercises the stream-json pipe protocol over
+                    # stdin, so use SubprocessCLITransport explicitly rather
+                    # than the default (PTY) transport.
+                    stream = message_stream()
+                    transport = SubprocessCLITransport(
+                        prompt=stream, options=ClaudeAgentOptions()
+                    )
                     # Run query with async iterable
                     messages = []
-                    async for msg in query(prompt=message_stream()):
+                    async for msg in query(prompt=stream, transport=transport):
                         messages.append(msg)
 
                     # Should get the result message
@@ -1124,7 +1131,7 @@ class TestClaudeSDKClientEdgeCases:
         """Test connecting twice."""
 
         with patch(
-            "claude_agent_sdk._internal.transport.subprocess_cli.SubprocessCLITransport"
+            "claude_agent_sdk._internal.transport.pty_cli.PtyCLITransport"
         ) as mock_transport_class:
             # Create a new mock transport for each call
             mock_transport_class.side_effect = [
@@ -1153,7 +1160,7 @@ class TestClaudeSDKClientEdgeCases:
         """Test context manager cleans up on exception."""
 
         with patch(
-            "claude_agent_sdk._internal.transport.subprocess_cli.SubprocessCLITransport"
+            "claude_agent_sdk._internal.transport.pty_cli.PtyCLITransport"
         ) as mock_transport_class:
             mock_transport = create_mock_transport()
             mock_transport_class.return_value = mock_transport
@@ -1170,7 +1177,7 @@ class TestClaudeSDKClientEdgeCases:
         """Test collecting messages with list comprehension as shown in examples."""
 
         with patch(
-            "claude_agent_sdk._internal.transport.subprocess_cli.SubprocessCLITransport"
+            "claude_agent_sdk._internal.transport.pty_cli.PtyCLITransport"
         ) as mock_transport_class:
             mock_transport = create_mock_transport()
             mock_transport_class.return_value = mock_transport
