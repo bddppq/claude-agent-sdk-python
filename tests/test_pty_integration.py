@@ -22,6 +22,7 @@ from __future__ import annotations
 import os
 import stat
 import uuid
+from dataclasses import replace
 from pathlib import Path
 
 import anyio
@@ -78,10 +79,13 @@ while True:
     chunk = os.read(0, 1)
     if not chunk:
         break
-    if chunk in (b"\r", b"\n"):
-        line = buf.decode("utf-8", "replace").strip()
+    if chunk == b"\r":
+        # Only a carriage return submits. Newlines inside a bracketed paste are
+        # literal content, and the guards are consumed like a real terminal.
+        line = buf.decode("utf-8", "replace")
+        line = line.replace("\x1b[200~", "").replace("\x1b[201~", "")
         buf = b""
-        if not line:
+        if not line.strip():  # the empty warmup-dismiss Enter
             continue
         turn += 1
         append({"type": "user", "sessionId": sid, "uuid": "u%d" % turn,
@@ -213,3 +217,39 @@ class TestStreamingClientMultiTurn:
                                     replies.append(block.text)
 
         assert replies == ["echo:first prompt", "echo:second prompt"]
+
+
+class TestPromptFidelity:
+    @pytest.mark.anyio
+    async def test_newline_and_leading_slash_round_trip(self, monkeypatch, tmp_path):
+        """A multi-line prompt with a leading '/' reaches the CLI with newlines
+        preserved (only a single leading space is added so the TUI does not
+        enter command mode)."""
+        options = _setup(monkeypatch, tmp_path)
+        prompt = "/keep this line one\nline two"
+
+        captured: list[str] = []
+        with anyio.fail_after(30):
+            async for msg in query(prompt=prompt, options=options):
+                if isinstance(msg, AssistantMessage):
+                    for block in msg.content:
+                        if isinstance(block, TextBlock):
+                            captured.append(block.text)
+
+        # The fake echoes the exact line it received.
+        assert captured == ["echo: /keep this line one\nline two"]
+
+
+class TestOptionValidation:
+    @pytest.mark.anyio
+    async def test_hooks_option_is_rejected(self, monkeypatch, tmp_path):
+        """Unsupported options fail loudly through the public query() API rather
+        than hanging or silently no-op-ing."""
+        from claude_agent_sdk import CLIConnectionError
+
+        options = _setup(monkeypatch, tmp_path)
+        options = replace(options, hooks={"PreToolUse": [{"hooks": [lambda *a: None]}]})
+
+        with pytest.raises(CLIConnectionError, match="hooks"), anyio.fail_after(30):
+            async for _ in query(prompt="hi", options=options):
+                pass

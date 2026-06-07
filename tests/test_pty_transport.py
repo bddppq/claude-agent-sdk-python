@@ -90,23 +90,34 @@ class TestTranslateTranscriptEntry:
         }
         assert _translate_transcript_entry(entry, "fallback") is None
 
-    def test_turn_duration_synthesizes_result(self):
+    def test_turn_duration_not_translated_directly(self):
+        # turn_duration is handled statefully by the tail loop (_emit_result),
+        # not by the pure translate function.
+        entry = {"type": "system", "subtype": "turn_duration", "durationMs": 1234}
+        assert _translate_transcript_entry(entry, "fallback") is None
+
+    def test_assistant_string_content_coerced(self):
+        # The transcript may write content as a bare string; it must not crash
+        # the parser (which iterates content blocks).
         entry = {
-            "type": "system",
-            "subtype": "turn_duration",
-            "durationMs": 1234,
-            "messageCount": 4,
-            "sessionId": "s-1",
-            "uuid": "u-3",
+            "type": "assistant",
+            "message": {"role": "assistant", "content": "hi there"},
+            "sessionId": "s",
         }
         out = _translate_transcript_entry(entry, "fallback")
         assert out is not None
-        assert out["type"] == "result"
-        assert out["subtype"] == "success"
-        assert out["is_error"] is False
-        assert out["duration_ms"] == 1234
-        assert out["num_turns"] == 4
-        assert out["session_id"] == "s-1"
+        assert out["message"]["content"] == [{"type": "text", "text": "hi there"}]
+        assert out["message"]["model"] == "unknown"  # backfilled
+
+    def test_parent_tool_use_id_carried(self):
+        entry = {
+            "type": "assistant",
+            "message": {"role": "assistant", "model": "m", "content": []},
+            "parentToolUseId": "tool-7",
+        }
+        out = _translate_transcript_entry(entry, "fallback")
+        assert out is not None
+        assert out["parent_tool_use_id"] == "tool-7"
 
     @pytest.mark.parametrize(
         "entry_type",
@@ -300,8 +311,8 @@ class TestEndInput:
         anyio.run(_test)
 
 
-class TestTypePromptCollapsesNewlines:
-    def test_newlines_become_spaces_then_submit(self):
+class TestTypePrompt:
+    def test_newlines_preserved_via_bracketed_paste(self):
         async def _test():
             t = make_transport()
             t._warmed_up = True  # skip the startup-toast warmup delay
@@ -312,8 +323,44 @@ class TestTypePromptCollapsesNewlines:
 
             t._pty_write = fake_pty_write  # type: ignore[method-assign]
             await t._type_prompt("line one\nline two")
-            assert writes[0] == b"line one line two"
+            joined = b"".join(writes)
+            # Bracketed-paste wrapped, newline preserved (not collapsed), then CR.
+            assert b"\x1b[200~line one\nline two\x1b[201~" in joined
             assert writes[-1] == b"\r"
+
+        anyio.run(_test)
+
+    @pytest.mark.parametrize("lead", ["/", "!", "#"])
+    def test_leading_tui_reserved_char_gets_space_prefix(self, lead):
+        async def _test():
+            t = make_transport()
+            t._warmed_up = True
+            writes: list[bytes] = []
+
+            async def fake_pty_write(data: bytes) -> None:
+                writes.append(data)
+
+            t._pty_write = fake_pty_write  # type: ignore[method-assign]
+            await t._type_prompt(f"{lead}do something")
+            joined = b"".join(writes)
+            # A single leading space is inserted so the TUI does not enter
+            # slash/bash/memory command mode.
+            assert f"\x1b[200~ {lead}do something\x1b[201~".encode() in joined
+
+        anyio.run(_test)
+
+    def test_normal_prompt_not_prefixed(self):
+        async def _test():
+            t = make_transport()
+            t._warmed_up = True
+            writes: list[bytes] = []
+
+            async def fake_pty_write(data: bytes) -> None:
+                writes.append(data)
+
+            t._pty_write = fake_pty_write  # type: ignore[method-assign]
+            await t._type_prompt("hello")
+            assert b"\x1b[200~hello\x1b[201~" in b"".join(writes)
 
         anyio.run(_test)
 
@@ -567,18 +614,13 @@ class TestControlMappings:
         anyio.run(_test)
 
     @pytest.mark.parametrize(
-        ("subtype", "command"),
-        [
-            ("mcp_status", b"/mcp"),
-            ("get_context_usage", b"/context"),
-            ("rewind_files", b"/rewind"),
-        ],
+        "subtype",
+        ["mcp_status", "get_context_usage", "rewind_files", "stop_task", "mcp_toggle"],
     )
-    def test_slash_command_controls(self, subtype, command):
+    def test_unsupported_controls_return_error(self, subtype):
         async def _test():
             t = make_transport()
             t._out_send, t._out_recv = anyio.create_memory_object_stream(10)
-            writes = _capture_pty_writes(t)
             await t._handle_control_request(
                 {
                     "type": "control_request",
@@ -586,11 +628,32 @@ class TestControlMappings:
                     "request": {"subtype": subtype},
                 }
             )
-            assert command in b"".join(writes)
-            # still acknowledges the request
+            # An explicit error response (not a fake success) so callers see it.
             resp = t._out_recv.receive_nowait()
             assert resp["type"] == "control_response"
-            assert resp["response"]["subtype"] == "success"
+            assert resp["response"]["subtype"] == "error"
+            assert "not supported" in resp["response"]["error"]
+
+        anyio.run(_test)
+
+    def test_set_permission_mode_uncyclable_returns_error_response(self):
+        async def _test():
+            t = make_transport()
+            t._permission_mode = "default"
+            t._out_send, t._out_recv = anyio.create_memory_object_stream(10)
+            await t._handle_control_request(
+                {
+                    "type": "control_request",
+                    "request_id": "r",
+                    "request": {
+                        "subtype": "set_permission_mode",
+                        "mode": "bypassPermissions",
+                    },
+                }
+            )
+            resp = t._out_recv.receive_nowait()
+            assert resp["response"]["subtype"] == "error"
+            assert "cannot be set live" in resp["response"]["error"]
 
         anyio.run(_test)
 
@@ -632,3 +695,268 @@ class TestWarmupConfigurable:
         """Integration tests rely on shrinking the warmup; guard the knob."""
         monkeypatch.setattr(pty_cli, "_WARMUP_SECONDS", 0.0)
         assert pty_cli._WARMUP_SECONDS == 0.0
+
+
+# --------------------------------------------------------------------------- #
+# Option validation — fail loud for unsupportable features
+# --------------------------------------------------------------------------- #
+
+
+class TestValidateOptions:
+    @pytest.mark.parametrize(
+        ("kwargs", "needle"),
+        [
+            ({"can_use_tool": lambda *a: None}, "can_use_tool"),
+            (
+                {"hooks": {"PreToolUse": [{"hooks": [lambda *a: None]}]}},
+                "hooks",
+            ),
+            ({"permission_prompt_tool_name": "stdio"}, "permission_prompt_tool_name"),
+        ],
+    )
+    def test_unsupported_options_raise(self, kwargs, needle):
+        from claude_agent_sdk._errors import CLIConnectionError
+
+        t = make_transport(**kwargs)
+        with pytest.raises(CLIConnectionError) as exc:
+            t._validate_options()
+        assert needle in str(exc.value)
+
+    def test_sdk_mcp_server_rejected_external_allowed(self):
+        from claude_agent_sdk._errors import CLIConnectionError
+
+        # An in-process SDK server is rejected...
+        t = make_transport(
+            mcp_servers={"x": {"type": "sdk", "name": "x", "instance": object()}}
+        )
+        with pytest.raises(CLIConnectionError):
+            t._validate_options()
+
+        # ...but external (stdio/http) servers validate fine.
+        t2 = make_transport(mcp_servers={"y": {"type": "stdio", "command": "srv"}})
+        t2._validate_options()  # must not raise
+
+    def test_supported_options_pass(self):
+        t = make_transport(model="opus", permission_mode="acceptEdits")
+        t._validate_options()  # must not raise
+
+    def test_observability_flags_warn_not_raise(self, caplog):
+        t = make_transport(include_partial_messages=True, include_hook_events=True)
+        with caplog.at_level("WARNING"):
+            t._validate_options()  # must not raise
+        assert any("include_partial_messages" in r.message for r in caplog.records)
+
+
+# --------------------------------------------------------------------------- #
+# Result synthesis fidelity (_emit_result / usage accumulation)
+# --------------------------------------------------------------------------- #
+
+
+class TestResultFidelity:
+    def test_result_carries_text_usage_and_turn_count(self, tmp_path):
+        async def _test():
+            t = make_transport()
+            path = tmp_path / "s.jsonl"
+            path.write_text(
+                "\n".join(
+                    json.dumps(line)
+                    for line in [
+                        {
+                            "type": "assistant",
+                            "sessionId": "s",
+                            "uuid": "a1",
+                            "message": {
+                                "role": "assistant",
+                                "model": "m",
+                                "content": [{"type": "text", "text": "hello "}],
+                                "usage": {"input_tokens": 10, "output_tokens": 2},
+                            },
+                        },
+                        {
+                            "type": "assistant",
+                            "sessionId": "s",
+                            "uuid": "a2",
+                            "message": {
+                                "role": "assistant",
+                                "model": "m",
+                                "content": [{"type": "text", "text": "world"}],
+                                "usage": {"input_tokens": 5, "output_tokens": 3},
+                            },
+                        },
+                        {"type": "system", "subtype": "turn_duration", "durationMs": 9},
+                    ]
+                )
+                + "\n"
+            )
+            t._transcript_path = path
+            t._out_send, t._out_recv = anyio.create_memory_object_stream(100)
+            t._input_ended = True
+            with anyio.fail_after(5):
+                await t._tail_loop()
+            return _drain(t)
+
+        msgs = anyio.run(_test)
+        result = next(m for m in msgs if m["type"] == "result")
+        assert result["result"] == "world"  # last assistant text
+        assert result["num_turns"] == 1
+        # usage summed across both assistant messages
+        assert result["usage"]["input_tokens"] == 15
+        assert result["usage"]["output_tokens"] == 5
+        assert result["is_error"] is False
+
+    def test_refusal_marks_error_result(self, tmp_path):
+        async def _test():
+            t = make_transport()
+            path = tmp_path / "s.jsonl"
+            path.write_text(
+                "\n".join(
+                    json.dumps(line)
+                    for line in [
+                        {
+                            "type": "assistant",
+                            "sessionId": "s",
+                            "uuid": "a1",
+                            "message": {
+                                "role": "assistant",
+                                "model": "m",
+                                "content": [{"type": "text", "text": "no"}],
+                                "stop_reason": "refusal",
+                            },
+                        },
+                        {"type": "system", "subtype": "turn_duration"},
+                    ]
+                )
+                + "\n"
+            )
+            t._transcript_path = path
+            t._out_send, t._out_recv = anyio.create_memory_object_stream(100)
+            t._input_ended = True
+            with anyio.fail_after(5):
+                await t._tail_loop()
+            return _drain(t)
+
+        msgs = anyio.run(_test)
+        result = next(m for m in msgs if m["type"] == "result")
+        assert result["is_error"] is True
+
+    def test_multi_turn_increments_num_turns(self, tmp_path):
+        async def _test():
+            t = make_transport()
+            path = tmp_path / "s.jsonl"
+
+            def turn(n):
+                return [
+                    {
+                        "type": "assistant",
+                        "sessionId": "s",
+                        "uuid": f"a{n}",
+                        "message": {
+                            "role": "assistant",
+                            "model": "m",
+                            "content": [{"type": "text", "text": f"r{n}"}],
+                        },
+                    },
+                    {
+                        "type": "system",
+                        "subtype": "turn_duration",
+                        "uuid": f"s{n}",
+                    },
+                ]
+
+            lines = turn(1) + turn(2)
+            path.write_text("\n".join(json.dumps(x) for x in lines) + "\n")
+            t._transcript_path = path
+            # not one-shot; stop by closing after reading
+            t._out_send, t._out_recv = anyio.create_memory_object_stream(100)
+            # Drive a single pass of the loop body via _emit_line directly.
+            for x in lines:
+                await t._emit_line(json.dumps(x).encode())
+            return _drain(t)
+
+        msgs = anyio.run(_test)
+        results = [m for m in msgs if m["type"] == "result"]
+        assert [r["num_turns"] for r in results] == [1, 2]
+
+
+# --------------------------------------------------------------------------- #
+# Dedup / compaction tolerance
+# --------------------------------------------------------------------------- #
+
+
+class TestDedup:
+    def test_duplicate_uuid_emitted_once(self):
+        async def _test():
+            t = make_transport()
+            t._out_send, t._out_recv = anyio.create_memory_object_stream(100)
+            line = json.dumps(
+                {
+                    "type": "assistant",
+                    "uuid": "dup",
+                    "sessionId": "s",
+                    "message": {
+                        "role": "assistant",
+                        "model": "m",
+                        "content": [{"type": "text", "text": "x"}],
+                    },
+                }
+            ).encode()
+            await t._emit_line(line)
+            await t._emit_line(line)  # re-read after a compaction reset
+            return _drain(t)
+
+        msgs = anyio.run(_test)
+        assert sum(1 for m in msgs if m["type"] == "assistant") == 1
+
+
+# --------------------------------------------------------------------------- #
+# Multimodal content warning
+# --------------------------------------------------------------------------- #
+
+
+class TestMultimodalWarning:
+    def test_non_text_blocks_warn_and_text_still_typed(self, caplog):
+        async def _test():
+            t = make_transport()
+            t._warmed_up = True
+            typed: list[str] = []
+
+            async def fake_type(text: str) -> None:
+                typed.append(text)
+
+            t._type_prompt = fake_type  # type: ignore[method-assign]
+            t._out_send, t._out_recv = anyio.create_memory_object_stream(10)
+            t._ready = True
+            with caplog.at_level("WARNING"):
+                await t.write(
+                    json.dumps(
+                        {
+                            "type": "user",
+                            "message": {
+                                "role": "user",
+                                "content": [
+                                    {"type": "text", "text": "describe"},
+                                    {"type": "image", "source": {}},
+                                ],
+                            },
+                        }
+                    )
+                    + "\n"
+                )
+            return typed, [r.message for r in caplog.records]
+
+        typed, warnings = anyio.run(_test)
+        assert typed == ["describe"]
+        assert any("non-text content" in w for w in warnings)
+
+
+# --------------------------------------------------------------------------- #
+# atexit cleanup registration
+# --------------------------------------------------------------------------- #
+
+
+class TestAtexitCleanup:
+    def test_terminate_process_discards_from_active_set(self):
+        t = make_transport()
+        pty_cli._ACTIVE_CHILDREN.add(t)
+        t._terminate_process()  # no process/fd; must be a safe no-op
+        assert t not in pty_cli._ACTIVE_CHILDREN
