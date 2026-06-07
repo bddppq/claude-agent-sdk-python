@@ -615,7 +615,7 @@ class TestControlMappings:
 
     @pytest.mark.parametrize(
         "subtype",
-        ["mcp_status", "get_context_usage", "rewind_files", "stop_task", "mcp_toggle"],
+        ["get_context_usage", "rewind_files", "stop_task", "mcp_toggle"],
     )
     def test_unsupported_controls_return_error(self, subtype):
         async def _test():
@@ -633,6 +633,56 @@ class TestControlMappings:
             assert resp["type"] == "control_response"
             assert resp["response"]["subtype"] == "error"
             assert "not supported" in resp["response"]["error"]
+
+        anyio.run(_test)
+
+    def test_initialize_returns_populated_server_info(self):
+        async def _test():
+            t = make_transport(
+                model="claude-opus-4-8",
+                allowed_tools=["Read", "Write"],
+                permission_mode="acceptEdits",
+            )
+            t._out_send, t._out_recv = anyio.create_memory_object_stream(10)
+            await t._handle_control_request(
+                {
+                    "type": "control_request",
+                    "request_id": "r",
+                    "request": {"subtype": "initialize"},
+                }
+            )
+            resp = t._out_recv.receive_nowait()
+            assert resp["response"]["subtype"] == "success"
+            info = resp["response"]["response"]
+            assert info["model"] == "claude-opus-4-8"
+            assert info["permissionMode"] == "acceptEdits"
+            assert "Read" in info["tools"] and "Write" in info["tools"]
+            # Documented init keys present (not a 5-field stub).
+            for key in ("mcp_servers", "slash_commands", "output_style", "cwd"):
+                assert key in info
+
+        anyio.run(_test)
+
+    def test_mcp_status_reports_configured_servers(self):
+        async def _test():
+            t = make_transport(
+                mcp_servers={
+                    "fs": {"type": "stdio", "command": "x"},
+                }
+            )
+            t._out_send, t._out_recv = anyio.create_memory_object_stream(10)
+            await t._handle_control_request(
+                {
+                    "type": "control_request",
+                    "request_id": "r",
+                    "request": {"subtype": "mcp_status"},
+                }
+            )
+            resp = t._out_recv.receive_nowait()
+            assert resp["response"]["subtype"] == "success"
+            servers = resp["response"]["response"]["mcpServers"]
+            assert servers[0]["name"] == "fs"
+            assert servers[0]["status"] == "pending"
 
         anyio.run(_test)
 

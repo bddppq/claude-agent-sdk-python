@@ -366,17 +366,55 @@ class PtyCLITransport(Transport):
 
         self._ready = True
 
-        # Surface a minimal init message so consumers can read the session id
-        # before the first turn lands in the transcript.
-        await self._out_send.send(
+        # Surface an init message so consumers can read the session id and
+        # server capabilities before the first turn lands in the transcript.
+        # Populated to mirror the stream-json system/init shape (M1).
+        init = self._build_init_data()
+        init.update(
             {
                 "type": "system",
                 "subtype": "init",
-                "session_id": self._session_id,
-                "cwd": self._cwd,
                 "uuid": str(uuid.uuid4()),
             }
         )
+        await self._out_send.send(init)
+
+    def _build_init_data(self) -> dict[str, Any]:
+        """Build the init/server-info payload from the configured options.
+
+        The interactive transcript carries no init record (verified: the only
+        ``system`` subtypes written are ``turn_duration`` and
+        ``stop_hook_summary``), so we reconstruct the stream-json ``system/init``
+        fields from options and faithful defaults. This keeps ``get_server_info``
+        non-empty and gives consumers the documented ``tools`` / ``mcp_servers``
+        / ``model`` / ``permissionMode`` / ``slash_commands`` / ``output_style``
+        keys instead of a 5-field stub.
+        """
+        o = self._options
+        tools: list[str] = []
+        if isinstance(o.tools, list):
+            tools = list(o.tools)
+        tools.extend(t for t in o.allowed_tools if t not in tools)
+
+        mcp_servers: list[dict[str, Any]] = []
+        if isinstance(o.mcp_servers, dict):
+            for name, cfg in o.mcp_servers.items():
+                entry: dict[str, Any] = {"name": name}
+                if isinstance(cfg, dict) and "type" in cfg:
+                    entry["type"] = cfg["type"]
+                mcp_servers.append(entry)
+
+        return {
+            "session_id": self._observed_session_id or self._session_id,
+            "cwd": self._cwd,
+            "tools": tools,
+            "mcp_servers": mcp_servers,
+            "model": o.model or "",
+            "permissionMode": self._permission_mode,
+            "apiKeySource": "none",
+            "slash_commands": [],
+            "output_style": "default",
+        }
 
     def _validate_options(self) -> None:
         """Reject options the interactive transport cannot honor.
@@ -895,7 +933,13 @@ class PtyCLITransport(Transport):
     # answered with an error control_response (rather than a fake success) so
     # callers get a clear failure instead of a silent no-op.
     _SUPPORTED_CONTROLS = frozenset(
-        {"initialize", "interrupt", "set_permission_mode", "set_model"}
+        {
+            "initialize",
+            "interrupt",
+            "set_permission_mode",
+            "set_model",
+            "mcp_status",
+        }
     )
 
     async def _handle_control_request(self, obj: dict[str, Any]) -> None:
@@ -911,21 +955,27 @@ class PtyCLITransport(Transport):
         subtype = request.get("subtype")
         request_id = obj.get("request_id")
         error: str | None = None
+        payload: dict[str, Any] = {}
 
         try:
-            if subtype == "interrupt":
+            if subtype == "initialize":
+                # Return populated server info (C3) so get_server_info() is not
+                # empty. No interactive action is needed.
+                payload = self._build_init_data()
+            elif subtype == "interrupt":
                 async with self._write_lock:
                     await self._pty_write(_INTERRUPT)
             elif subtype == "set_permission_mode":
                 error = await self._set_permission_mode(request.get("mode"))
             elif subtype == "set_model":
                 error = await self._set_model(request.get("model"))
+            elif subtype == "mcp_status":
+                payload = self._mcp_status_payload()
             elif subtype not in self._SUPPORTED_CONTROLS:
                 error = (
                     f"control request '{subtype}' is not supported by the "
                     "interactive transport"
                 )
-            # initialize needs no interactive action.
         except Exception as e:  # noqa: BLE001
             logger.debug("Interactive control action failed", exc_info=True)
             error = f"interactive control action failed: {e}"
@@ -948,10 +998,29 @@ class PtyCLITransport(Transport):
                     "response": {
                         "subtype": "success",
                         "request_id": request_id,
-                        "response": {},
+                        "response": payload,
                     },
                 }
             )
+
+    def _mcp_status_payload(self) -> dict[str, Any]:
+        """Best-effort MCP status from the configured servers (C4).
+
+        The interactive transcript exposes no live MCP connection state, so we
+        report each configured server with a ``pending`` status (the CLI's
+        "configured but state unknown" value) and its config. This is a faithful
+        drop-in shape (``{"mcpServers": [...]}``) rather than raising, while not
+        fabricating a ``connected`` status we cannot verify.
+        """
+        servers: list[dict[str, Any]] = []
+        o = self._options
+        if isinstance(o.mcp_servers, dict):
+            for name, cfg in o.mcp_servers.items():
+                entry: dict[str, Any] = {"name": name, "status": "pending"}
+                if isinstance(cfg, dict):
+                    entry["config"] = {k: v for k, v in cfg.items() if k != "instance"}
+                servers.append(entry)
+        return {"mcpServers": servers}
 
     async def _set_permission_mode(self, mode: str | None) -> str | None:
         """Cycle the TUI permission mode to ``mode`` via shift+tab.
