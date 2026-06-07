@@ -376,9 +376,14 @@ class PtyCLITransport(Transport):
 
         self._transcript_path = self._compute_transcript_path()
 
+        # Honor options.max_buffer_size for the message buffer (M8). It bounded a
+        # byte pipe in the old transport; here it bounds the count of buffered
+        # message dicts, which is the closest interactive equivalent. Default to
+        # 1000 when unset.
+        buffer_size = self._options.max_buffer_size or 1000
         self._out_send, self._out_recv = anyio.create_memory_object_stream[
             dict[str, Any]
-        ](max_buffer_size=1000)
+        ](max_buffer_size=buffer_size)
 
         self._init_question_screen()
 
@@ -501,8 +506,9 @@ class PtyCLITransport(Transport):
             )
         if o.max_buffer_size is not None:
             logger.debug(
-                "max_buffer_size is ignored by the interactive transport "
-                "(messages are read from the transcript file, not a pipe)."
+                "max_buffer_size bounds the count of buffered message dicts in "
+                "the interactive transport (the closest equivalent to the old "
+                "byte-pipe buffer)."
             )
 
     def _build_env(self) -> dict[str, str]:

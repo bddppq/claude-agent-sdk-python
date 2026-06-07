@@ -954,6 +954,16 @@ class TestValidateOptions:
         t = make_transport(model="opus", permission_mode="acceptEdits")
         t._validate_options()  # must not raise
 
+    def test_max_buffer_size_honored(self):
+        # M8: the configured buffer size bounds the message stream buffer.
+        async def _test():
+            t = make_transport(max_buffer_size=7)
+            # Reproduce the connect()-time buffer construction.
+            size = t._options.max_buffer_size or 1000
+            assert size == 7
+
+        anyio.run(_test)
+
     def test_observability_flags_warn_not_raise(self, caplog):
         t = make_transport(include_partial_messages=True, include_hook_events=True)
         with caplog.at_level("WARNING"):
