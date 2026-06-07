@@ -59,6 +59,7 @@ from ...types import ClaudeAgentOptions
 from .._task_compat import TaskHandle, spawn_detached
 from ..sessions import _canonicalize_path, _get_projects_dir, _sanitize_path
 from . import Transport, _cli_command
+from ._usage import TurnUsageAccumulator
 from .pty_question import (
     SCREEN_COLS,
     SCREEN_ROWS,
@@ -267,9 +268,23 @@ class PtyCLITransport(Transport):
         # Per-turn state used to synthesize a faithful ``result`` message.
         self._turn_count = 0
         self._turn_text = ""
-        self._turn_usage: dict[str, Any] | None = None
+        self._turn_usage = TurnUsageAccumulator()
         self._turn_is_error = False
         self._turn_error_text: str | None = None
+        self._turn_subtype: str | None = None
+        self._turn_stop_reason: str | None = None
+        self._turn_model: str | None = None
+        # Count of assistant + tool-result messages in the current turn, used as
+        # a fallback for num_turns when the CLI's messageCount is unavailable.
+        self._turn_messages = 0
+        # Permission denials observed in the current turn (answered "deny" via
+        # the TUI question detector). Surfaced on the result like stream-json.
+        self._turn_permission_denials: list[dict[str, Any]] = []
+        # Real session id discovered from transcript records (resume/fork can
+        # make the CLI use an id different from the one we generated).
+        self._observed_session_id: str | None = None
+        # Cached server-info payload for get_server_info() / initialize ack.
+        self._server_info: dict[str, Any] | None = None
         # Dedup transcript records by uuid so a mid-session compaction/rewrite
         # (which resets the read offset) cannot re-emit already-seen messages.
         self._seen_uuids: set[str] = set()
@@ -724,6 +739,13 @@ class PtyCLITransport(Transport):
         if entry_type in _SKIP_TRANSCRIPT_TYPES:
             return
 
+        # Track the real session id the CLI is using (resume/fork may differ
+        # from our generated one). Used to keep session_id consistent on every
+        # emitted message and on the result.
+        sid = entry.get("sessionId")
+        if isinstance(sid, str) and sid:
+            self._observed_session_id = sid
+
         # Dedup by uuid so a compaction-triggered re-read can't double-emit.
         uid = entry.get("uuid")
         if isinstance(uid, str):
@@ -746,47 +768,99 @@ class PtyCLITransport(Transport):
             text = _extract_text(msg)
             if text:
                 self._turn_text = text
-            self._accumulate_usage(msg.get("usage"))
-            if msg.get("error") or msg.get("stop_reason") == "refusal":
+            model = msg.get("model")
+            if isinstance(model, str) and model and model != "unknown":
+                self._turn_model = model
+            stop_reason = msg.get("stop_reason")
+            if isinstance(stop_reason, str):
+                self._turn_stop_reason = stop_reason
+            self._turn_usage.add(msg.get("id"), model, msg.get("usage"))
+            # Each assistant message is a CLI "turn" (API round-trip); count
+            # them so num_turns matches the stream-json baseline, which counts
+            # API turns rather than user prompts.
+            self._turn_messages += 1
+            err = msg.get("error")
+            if err or stop_reason == "refusal":
                 self._turn_is_error = True
+                self._turn_subtype = self._error_subtype(err, stop_reason)
+        elif entry_type == "user":
+            # Tool-result user records are also turns in the CLI's accounting.
+            self._turn_messages += 1
 
         await self._send(message)
+
+    @staticmethod
+    def _error_subtype(error: Any, stop_reason: str | None) -> str:
+        """Map an assistant error/stop_reason to a result subtype.
+
+        Mirrors the stream-json result subtypes so consumers branching on
+        ``subtype`` (refusal, max-turns, budget) keep working.
+        """
+        if stop_reason == "refusal":
+            return "error_during_execution"
+        if isinstance(error, str):
+            low = error.lower()
+            if "max_turns" in low or "max turns" in low:
+                return "error_max_turns"
+            if "budget" in low:
+                return "error_max_budget_usd"
+        return "error_during_execution"
 
     async def _emit_result(self, entry: dict[str, Any]) -> None:
         """Synthesize and emit a result from a ``turn_duration`` record."""
         self._turn_count += 1
         duration = entry.get("durationMs", 0)
+        # num_turns: prefer the CLI's own messageCount for the turn (matches the
+        # stream-json baseline, which counts API turns, not user prompts);
+        # fall back to the assistant/tool-result messages we observed.
+        message_count = entry.get("messageCount")
+        if isinstance(message_count, int) and message_count > 0:
+            num_turns = message_count
+        else:
+            num_turns = max(self._turn_messages, 1)
+
+        subtype = (
+            (self._turn_subtype or "error_during_execution")
+            if self._turn_is_error
+            else "success"
+        )
         result: dict[str, Any] = {
             "type": "result",
-            "subtype": "error_during_execution" if self._turn_is_error else "success",
+            "subtype": subtype,
             "duration_ms": duration,
+            # No per-API duration is recorded in the transcript; the turn's
+            # wall-clock duration is the closest faithful value.
             "duration_api_ms": duration,
             "is_error": self._turn_is_error,
-            "num_turns": self._turn_count,
-            "session_id": entry.get("sessionId") or self._session_id,
+            "num_turns": num_turns,
+            "session_id": self._observed_session_id
+            or entry.get("sessionId")
+            or self._session_id,
             "result": self._turn_text or None,
+            "stop_reason": self._turn_stop_reason,
             "uuid": entry.get("uuid"),
         }
-        if self._turn_usage is not None:
-            result["usage"] = self._turn_usage
+        if self._turn_usage.has_data():
+            result["usage"] = self._turn_usage.aggregate_usage()
+            cost = self._turn_usage.total_cost()
+            if cost is not None:
+                result["total_cost_usd"] = cost
+            model_usage = self._turn_usage.model_usage()
+            if model_usage is not None:
+                result["model_usage"] = model_usage
+        # permission_denials: empty list (faithful default; stream-json always
+        # sent a list, never None, so formatting that iterates it works).
+        result["permission_denials"] = list(self._turn_permission_denials)
         self._result_emitted = True
         await self._send(result)
         # Reset per-turn accumulators for the next turn.
         self._turn_text = ""
-        self._turn_usage = None
+        self._turn_usage = TurnUsageAccumulator()
         self._turn_is_error = False
-
-    def _accumulate_usage(self, usage: Any) -> None:
-        """Sum token-usage fields across the assistant messages of a turn."""
-        if not isinstance(usage, dict):
-            return
-        if self._turn_usage is None:
-            self._turn_usage = {}
-        for k, v in usage.items():
-            if isinstance(v, (int, float)) and not isinstance(v, bool):
-                self._turn_usage[k] = self._turn_usage.get(k, 0) + v
-            else:
-                self._turn_usage.setdefault(k, v)
+        self._turn_subtype = None
+        self._turn_stop_reason = None
+        self._turn_messages = 0
+        self._turn_permission_denials = []
 
     async def _send(self, message: dict[str, Any]) -> None:
         if self._out_send is not None:

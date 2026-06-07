@@ -798,7 +798,9 @@ class TestResultFidelity:
         msgs = anyio.run(_test)
         result = next(m for m in msgs if m["type"] == "result")
         assert result["result"] == "world"  # last assistant text
-        assert result["num_turns"] == 1
+        # num_turns counts API turns within the CLI turn (the stream-json
+        # baseline semantics): two assistant messages -> 2.
+        assert result["num_turns"] == 2
         # usage summed across both assistant messages
         assert result["usage"]["input_tokens"] == 15
         assert result["usage"]["output_tokens"] == 5
@@ -839,12 +841,157 @@ class TestResultFidelity:
         result = next(m for m in msgs if m["type"] == "result")
         assert result["is_error"] is True
 
-    def test_multi_turn_increments_num_turns(self, tmp_path):
+    def test_result_carries_cost_model_usage_stop_reason(self, tmp_path):
+        async def _test():
+            t = make_transport()
+            path = tmp_path / "s.jsonl"
+            path.write_text(
+                "\n".join(
+                    json.dumps(line)
+                    for line in [
+                        {
+                            "type": "assistant",
+                            "sessionId": "s",
+                            "uuid": "a1",
+                            "message": {
+                                "role": "assistant",
+                                "id": "msg_1",
+                                "model": "claude-opus-4-8",
+                                "content": [{"type": "text", "text": "done"}],
+                                "stop_reason": "end_turn",
+                                "usage": {
+                                    "input_tokens": 1_000_000,
+                                    "output_tokens": 0,
+                                },
+                            },
+                        },
+                        # Duplicate snapshot of the same message id -> must not
+                        # double-count cost/usage.
+                        {
+                            "type": "assistant",
+                            "sessionId": "s",
+                            "uuid": "a1b",
+                            "message": {
+                                "role": "assistant",
+                                "id": "msg_1",
+                                "model": "claude-opus-4-8",
+                                "content": [{"type": "text", "text": "done"}],
+                                "stop_reason": "end_turn",
+                                "usage": {
+                                    "input_tokens": 1_000_000,
+                                    "output_tokens": 0,
+                                },
+                            },
+                        },
+                        {
+                            "type": "system",
+                            "subtype": "turn_duration",
+                            "durationMs": 100,
+                            "messageCount": 5,
+                        },
+                    ]
+                )
+                + "\n"
+            )
+            t._transcript_path = path
+            t._out_send, t._out_recv = anyio.create_memory_object_stream(100)
+            t._input_ended = True
+            with anyio.fail_after(5):
+                await t._tail_loop()
+            return _drain(t)
+
+        msgs = anyio.run(_test)
+        result = next(m for m in msgs if m["type"] == "result")
+        # cost computed from usage x opus pricing; dedup keeps it at 5.0 not 10.0
+        assert result["total_cost_usd"] == 5.0
+        assert result["usage"]["input_tokens"] == 1_000_000
+        assert result["stop_reason"] == "end_turn"
+        assert result["num_turns"] == 5
+        assert result["model_usage"]["claude-opus-4-8"]["cost_usd"] == 5.0
+        # permission_denials is always a list (never None), like stream-json.
+        assert result["permission_denials"] == []
+
+    def test_refusal_result_subtype(self, tmp_path):
+        async def _test():
+            t = make_transport()
+            path = tmp_path / "s.jsonl"
+            path.write_text(
+                "\n".join(
+                    json.dumps(line)
+                    for line in [
+                        {
+                            "type": "assistant",
+                            "sessionId": "s",
+                            "uuid": "a1",
+                            "message": {
+                                "role": "assistant",
+                                "model": "claude-opus-4-8",
+                                "content": [{"type": "text", "text": "no"}],
+                                "stop_reason": "refusal",
+                            },
+                        },
+                        {"type": "system", "subtype": "turn_duration"},
+                    ]
+                )
+                + "\n"
+            )
+            t._transcript_path = path
+            t._out_send, t._out_recv = anyio.create_memory_object_stream(100)
+            t._input_ended = True
+            with anyio.fail_after(5):
+                await t._tail_loop()
+            return _drain(t)
+
+        msgs = anyio.run(_test)
+        result = next(m for m in msgs if m["type"] == "result")
+        assert result["is_error"] is True
+        assert result["stop_reason"] == "refusal"
+
+    def test_max_turns_error_subtype(self, tmp_path):
+        async def _test():
+            t = make_transport()
+            path = tmp_path / "s.jsonl"
+            path.write_text(
+                "\n".join(
+                    json.dumps(line)
+                    for line in [
+                        {
+                            "type": "assistant",
+                            "sessionId": "s",
+                            "uuid": "a1",
+                            "message": {
+                                "role": "assistant",
+                                "model": "claude-opus-4-8",
+                                "content": [{"type": "text", "text": "stop"}],
+                                "error": "max_turns exceeded",
+                            },
+                        },
+                        {"type": "system", "subtype": "turn_duration"},
+                    ]
+                )
+                + "\n"
+            )
+            t._transcript_path = path
+            t._out_send, t._out_recv = anyio.create_memory_object_stream(100)
+            t._input_ended = True
+            with anyio.fail_after(5):
+                await t._tail_loop()
+            return _drain(t)
+
+        msgs = anyio.run(_test)
+        result = next(m for m in msgs if m["type"] == "result")
+        assert result["is_error"] is True
+        assert result["subtype"] == "error_max_turns"
+
+    def test_num_turns_uses_cli_message_count(self, tmp_path):
+        # The CLI records messageCount on turn_duration; num_turns mirrors it
+        # (stream-json counts API turns, not cumulative user prompts). Each turn
+        # is independent: num_turns resets between turns.
         async def _test():
             t = make_transport()
             path = tmp_path / "s.jsonl"
 
-            def turn(n):
+            def turn(n, message_count):
                 return [
                     {
                         "type": "assistant",
@@ -860,22 +1007,22 @@ class TestResultFidelity:
                         "type": "system",
                         "subtype": "turn_duration",
                         "uuid": f"s{n}",
+                        "messageCount": message_count,
                     },
                 ]
 
-            lines = turn(1) + turn(2)
+            lines = turn(1, 3) + turn(2, 7)
             path.write_text("\n".join(json.dumps(x) for x in lines) + "\n")
             t._transcript_path = path
-            # not one-shot; stop by closing after reading
             t._out_send, t._out_recv = anyio.create_memory_object_stream(100)
-            # Drive a single pass of the loop body via _emit_line directly.
             for x in lines:
                 await t._emit_line(json.dumps(x).encode())
             return _drain(t)
 
         msgs = anyio.run(_test)
         results = [m for m in msgs if m["type"] == "result"]
-        assert [r["num_turns"] for r in results] == [1, 2]
+        # Each result uses that turn's own messageCount.
+        assert [r["num_turns"] for r in results] == [3, 7]
 
 
 # --------------------------------------------------------------------------- #
