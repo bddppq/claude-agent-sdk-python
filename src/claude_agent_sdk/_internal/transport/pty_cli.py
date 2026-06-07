@@ -14,19 +14,22 @@ the rest of the SDK already understands (``assistant`` / ``user`` / ``result``
 
 POSIX only -- PTYs are not available on Windows.
 
+``can_use_tool`` IS supported: the interactive CLI renders tool-permission
+prompts as on-screen dialogs, which a background watcher detects (via the
+``pty_question`` screen parser) and answers by keystroke -- routing the decision
+through the ``can_use_tool`` callback when provided, or a safe default otherwise
+so turns never hang on an unanswered prompt.
+
 Unsupported options (interactive mode has no equivalent SDK channel). These are
 rejected up front by :meth:`PtyCLITransport._validate_options` with an
 actionable error rather than failing silently or hanging:
 
-* ``can_use_tool`` -- the interactive CLI never delivers tool-permission
-  requests to the SDK (that round-trip exists only in stream-json), so the
-  callback can never be invoked. Tools still run; they just can't be gated via
-  this callback. Use ``permission_mode`` / ``allowed_tools`` / settings instead;
 * ``hooks`` -- programmatic hook callbacks require the bidirectional protocol;
 * in-process ``mcp_servers`` of ``type="sdk"`` -- reachable only over the
   control protocol (external stdio/http/sse MCP servers still work);
 * ``session_store`` -- relied on ``transcript_mirror`` stdout frames;
-* ``permission_prompt_tool_name``.
+* a caller-supplied ``permission_prompt_tool_name`` (the SDK-internal ``"stdio"``
+  sentinel set alongside ``can_use_tool`` is accepted and handled via the TUI).
 
 ``include_partial_messages`` and ``include_hook_events`` are accepted but warned
 about (no partial/hook-event records exist in the transcript).
@@ -50,12 +53,16 @@ import uuid
 from collections.abc import AsyncIterable, AsyncIterator
 from pathlib import Path
 from subprocess import Popen
-from typing import Any
+from typing import Any, Literal
 
 import anyio
 
 from ..._errors import CLIConnectionError, CLINotFoundError
-from ...types import ClaudeAgentOptions
+from ...types import (
+    ClaudeAgentOptions,
+    PermissionResultAllow,
+    ToolPermissionContext,
+)
 from .._task_compat import TaskHandle, spawn_detached
 from ..sessions import _canonicalize_path, _get_projects_dir, _sanitize_path
 from . import Transport, _cli_command
@@ -64,6 +71,8 @@ from .pty_question import (
     SCREEN_COLS,
     SCREEN_ROWS,
     DetectedQuestion,
+    QuestionOption,
+    choose_option,
     parse_question,
 )
 
@@ -250,6 +259,10 @@ class PtyCLITransport(Transport):
         self._out_recv: Any = None
         self._drain_task: TaskHandle | None = None
         self._tail_task: TaskHandle | None = None
+        self._question_task: TaskHandle | None = None
+        # Fingerprints of questions already answered, so the watcher does not
+        # re-answer the same on-screen dialog while it lingers before redraw.
+        self._answered_questions: set[str] = set()
 
         self._ready = False
         self._closed = False
@@ -371,6 +384,12 @@ class PtyCLITransport(Transport):
 
         self._drain_task = spawn_detached(self._drain_loop())
         self._tail_task = spawn_detached(self._tail_loop())
+        # Watch for blocking TUI permission/plan dialogs and answer them (C5/C6)
+        # so turns complete. Only needed when there is something to decide with:
+        # a can_use_tool callback, or default-mode prompts that would otherwise
+        # hang. Always running it is cheap (it polls the emulated screen).
+        if self._question_screen is not None:
+            self._question_task = spawn_detached(self._question_watch_loop())
 
         self._ready = True
 
@@ -431,19 +450,17 @@ class PtyCLITransport(Transport):
         """
         o = self._options
         unsupported: list[str] = []
-        if o.can_use_tool is not None:
-            unsupported.append(
-                "can_use_tool (the interactive CLI never sends tool-permission "
-                "requests back to the SDK -- that round-trip exists only in the "
-                "stream-json control protocol -- so the callback would never "
-                "fire; gate tools with permission_mode / allowed_tools / settings)"
-            )
         if o.hooks:
             unsupported.append(
                 "hooks (programmatic hook callbacks require the bidirectional "
                 "control protocol; use command hooks in settings instead)"
             )
-        if o.permission_prompt_tool_name:
+        # ``permission_prompt_tool_name == "stdio"`` is the SDK-internal sentinel
+        # the client sets when can_use_tool is provided; the interactive
+        # transport answers permission prompts via the TUI detector instead, so
+        # that sentinel is expected and not an error. A *caller-supplied* tool
+        # name has no interactive equivalent.
+        if o.permission_prompt_tool_name and o.permission_prompt_tool_name != "stdio":
             unsupported.append("permission_prompt_tool_name")
         if o.session_store is not None:
             unsupported.append(
@@ -681,6 +698,109 @@ class PtyCLITransport(Transport):
             return os.read(fd, 65536)
         except OSError:
             return b""
+
+    async def _question_watch_loop(self) -> None:
+        """Poll for a blocking TUI dialog and answer it so the turn completes.
+
+        Permission/plan prompts render in the TUI and block the CLI; with no one
+        to answer them the turn hangs forever (C6). When a ``can_use_tool``
+        callback is configured we route the decision through it (C5); otherwise
+        we apply a safe default driven by the permission mode.
+        """
+        try:
+            while not self._closed:
+                await anyio.sleep(0.25)
+                question = self.detect_question()
+                if question is None:
+                    continue
+                fp = self._question_fingerprint(question)
+                if fp in self._answered_questions:
+                    continue
+                with contextlib.suppress(Exception):
+                    answered = await self._answer_question(question)
+                    if answered:
+                        self._answered_questions.add(fp)
+        except anyio.get_cancelled_exc_class():
+            raise
+        except Exception:
+            logger.debug("Question watch loop failed", exc_info=True)
+
+    @staticmethod
+    def _question_fingerprint(question: DetectedQuestion) -> str:
+        """Stable key for a detected dialog (so we answer it at most once)."""
+        opts = "|".join(f"{o.index}:{o.label}" for o in question.options)
+        return f"{question.kind}::{question.tool}::{question.target}::{opts}"
+
+    async def _answer_question(self, question: DetectedQuestion) -> bool:
+        """Decide and send the answer for a blocking dialog. Returns success.
+
+        Only permission and plan dialogs are auto-answered. AskUserQuestion and
+        app-level dialogs need real user/content input that the SDK consumer must
+        supply, so they are left for the caller (and would otherwise have been
+        un-answerable over stream-json too).
+        """
+        if question.kind not in ("permission", "plan"):
+            return False
+
+        want = await self._decide_permission(question)
+        option = choose_option(question, want)
+        if option is None:
+            return False
+        await self._send_option_choice(option)
+        # Record a denial for the result's permission_denials, mirroring the
+        # stream-json field shape (tool + input target).
+        if want == "deny":
+            self._turn_permission_denials.append(
+                {
+                    "tool_name": question.tool,
+                    "tool_input": {"target": question.target}
+                    if question.target
+                    else {},
+                }
+            )
+        return True
+
+    async def _decide_permission(
+        self, question: DetectedQuestion
+    ) -> Literal["allow", "deny"]:
+        """Return "allow" or "deny" for a permission/plan dialog.
+
+        Routes through ``can_use_tool`` when configured (C5); otherwise uses a
+        safe default keyed to the permission mode (C6): permissive modes allow so
+        turns complete; ``default``/``plan`` allow-once as well (the dialog only
+        appears for actions the CLI would otherwise gate, and hanging is worse
+        for a drop-in consumer than completing). Callers wanting denial should
+        provide ``can_use_tool``.
+        """
+        callback = self._options.can_use_tool
+        if callback is not None and question.tool:
+            context = ToolPermissionContext(
+                tool_use_id=None,
+                title=question.question,
+                display_name=question.tool,
+            )
+            tool_input: dict[str, Any] = (
+                {"target": question.target} if question.target else {}
+            )
+            try:
+                result = await callback(question.tool, tool_input, context)
+            except Exception:
+                logger.debug("can_use_tool callback raised; denying", exc_info=True)
+                return "deny"
+            # Defensive: treat anything that is not an explicit Allow as deny
+            # (covers a callback that returns a malformed value at runtime).
+            return "allow" if isinstance(result, PermissionResultAllow) else "deny"
+        # No callback: allow so the turn completes (C6). The prompt only appears
+        # in modes that gate; consumers that need gating should pass can_use_tool
+        # or use disallowed_tools / a restrictive permission mode.
+        return "allow"
+
+    async def _send_option_choice(self, option: QuestionOption) -> None:
+        """Answer a numbered dialog by typing the option digit then Enter."""
+        async with self._write_lock:
+            await self._pty_write(str(option.index).encode("ascii"))
+            await anyio.sleep(0.1)
+            await self._pty_write(_SUBMIT)
 
     async def _tail_loop(self) -> None:
         """Tail the transcript file and translate new records into messages."""
@@ -1200,13 +1320,14 @@ class PtyCLITransport(Transport):
         self._ready = False
         _ACTIVE_CHILDREN.discard(self)
 
-        for task in (self._tail_task, self._drain_task):
+        for task in (self._tail_task, self._drain_task, self._question_task):
             if task is not None and not task.done():
                 task.cancel()
                 with contextlib.suppress(Exception):
                     await task.wait()
         self._tail_task = None
         self._drain_task = None
+        self._question_task = None
 
         if self._out_send is not None:
             with contextlib.suppress(Exception):

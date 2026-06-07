@@ -299,3 +299,37 @@ def parse_question(lines: list[str]) -> DetectedQuestion | None:
         preview=preview,
         headers=headers,
     )
+
+
+def choose_option(
+    question: DetectedQuestion, want: Literal["allow", "deny"]
+) -> QuestionOption | None:
+    """Pick the option that best expresses an allow/deny decision.
+
+    Used to answer a blocking permission/plan dialog by keystroke. ``want`` is
+    the decision derived from ``can_use_tool`` (or the safe default). Returns the
+    chosen :class:`QuestionOption` (whose ``index`` is the digit to type), or
+    ``None`` if no suitable option exists.
+
+    Allow prefers a one-shot allow over a persist-all option (least surprising:
+    we do not silently widen permissions for the whole session). Deny prefers an
+    explicit deny/no option.
+    """
+    if not question.options:
+        return None
+    if want == "deny":
+        deny = [o for o in question.options if o.action == "deny"]
+        if deny:
+            return deny[0]
+        # Plan dialogs phrase rejection as "keep planning"/"no"; fall back to the
+        # last option, which is conventionally the negative choice.
+        return question.options[-1]
+    # want == "allow"
+    once = [o for o in question.options if o.action == "allow_once"]
+    if once:
+        return once[0]
+    persist = [o for o in question.options if o.action == "allow_persist"]
+    if persist:
+        return persist[0]
+    # No clearly-allow option (e.g. an ask form); fall back to the first option.
+    return question.options[0]

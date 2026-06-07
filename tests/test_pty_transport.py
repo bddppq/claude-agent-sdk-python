@@ -776,6 +776,115 @@ class TestReadMessageOrdering:
         anyio.run(_test)
 
 
+class TestPermissionAnswering:
+    """C5/C6: answering blocking TUI permission dialogs."""
+
+    @staticmethod
+    def _permission_question(*, deny_opt=True):
+        from claude_agent_sdk._internal.transport.pty_question import (
+            DetectedQuestion,
+            QuestionOption,
+        )
+
+        opts = [QuestionOption(index=1, label="Yes", action="allow_once")]
+        if deny_opt:
+            opts.append(QuestionOption(index=2, label="No", action="deny"))
+        return DetectedQuestion(
+            kind="permission",
+            question="Allow Write?",
+            options=opts,
+            tool="Write",
+            target="note.txt",
+        )
+
+    def test_default_allows_to_complete_turn(self):
+        # C6: with no callback, the dialog is answered "allow" (option 1) so the
+        # turn does not hang.
+        async def _test():
+            t = make_transport()
+            writes = _capture_pty_writes(t)
+            answered = await t._answer_question(self._permission_question())
+            assert answered is True
+            joined = b"".join(writes)
+            assert b"1" in joined and writes[-1] == b"\r"
+
+        anyio.run(_test)
+
+    def test_can_use_tool_allow(self):
+        async def _test():
+            from claude_agent_sdk import PermissionResultAllow
+
+            async def cb(tool, tool_input, ctx):
+                assert tool == "Write"
+                assert tool_input == {"target": "note.txt"}
+                return PermissionResultAllow()
+
+            t = make_transport(can_use_tool=cb)
+            writes = _capture_pty_writes(t)
+            await t._answer_question(self._permission_question())
+            joined = b"".join(writes)
+            assert b"1" in joined  # allow_once option
+
+        anyio.run(_test)
+
+    def test_can_use_tool_deny_selects_deny_and_records_denial(self):
+        async def _test():
+            from claude_agent_sdk import PermissionResultDeny
+
+            async def cb(tool, tool_input, ctx):
+                return PermissionResultDeny(message="nope")
+
+            t = make_transport(can_use_tool=cb)
+            writes = _capture_pty_writes(t)
+            await t._answer_question(self._permission_question())
+            joined = b"".join(writes)
+            assert b"2" in joined  # deny option
+            assert t._turn_permission_denials == [
+                {"tool_name": "Write", "tool_input": {"target": "note.txt"}}
+            ]
+
+        anyio.run(_test)
+
+    def test_callback_exception_denies(self):
+        async def _test():
+            async def cb(tool, tool_input, ctx):
+                raise RuntimeError("boom")
+
+            t = make_transport(can_use_tool=cb)
+            decision = await t._decide_permission(self._permission_question())
+            assert decision == "deny"
+
+        anyio.run(_test)
+
+    def test_ask_and_app_dialogs_not_auto_answered(self):
+        async def _test():
+            from claude_agent_sdk._internal.transport.pty_question import (
+                DetectedQuestion,
+                QuestionOption,
+            )
+
+            t = make_transport()
+            q = DetectedQuestion(
+                kind="ask",
+                question="Which?",
+                options=[QuestionOption(index=1, label="A")],
+            )
+            assert await t._answer_question(q) is False
+
+        anyio.run(_test)
+
+    def test_fingerprint_stable_and_distinct(self):
+        q1 = self._permission_question()
+        q2 = self._permission_question()
+        assert PtyCLITransport._question_fingerprint(
+            q1
+        ) == PtyCLITransport._question_fingerprint(q2)
+        q3 = self._permission_question(deny_opt=False)
+        assert PtyCLITransport._question_fingerprint(
+            q1
+        ) != PtyCLITransport._question_fingerprint(q3)
+
+
 class TestWarmupConfigurable:
     def test_warmup_seconds_is_patchable(self, monkeypatch):
         """Integration tests rely on shrinking the warmup; guard the knob."""
@@ -792,12 +901,14 @@ class TestValidateOptions:
     @pytest.mark.parametrize(
         ("kwargs", "needle"),
         [
-            ({"can_use_tool": lambda *a: None}, "can_use_tool"),
             (
                 {"hooks": {"PreToolUse": [{"hooks": [lambda *a: None]}]}},
                 "hooks",
             ),
-            ({"permission_prompt_tool_name": "stdio"}, "permission_prompt_tool_name"),
+            (
+                {"permission_prompt_tool_name": "my_tool"},
+                "permission_prompt_tool_name",
+            ),
         ],
     )
     def test_unsupported_options_raise(self, kwargs, needle):
@@ -807,6 +918,23 @@ class TestValidateOptions:
         with pytest.raises(CLIConnectionError) as exc:
             t._validate_options()
         assert needle in str(exc.value)
+
+    def test_can_use_tool_is_accepted(self):
+        # can_use_tool is now answered via the TUI question detector (C5), so it
+        # must not be rejected at validation.
+        async def cb(*_a):
+            from claude_agent_sdk import PermissionResultAllow
+
+            return PermissionResultAllow()
+
+        t = make_transport(can_use_tool=cb)
+        t._validate_options()  # must not raise
+
+    def test_stdio_permission_sentinel_accepted(self):
+        # The client sets permission_prompt_tool_name="stdio" when can_use_tool
+        # is provided; that sentinel must be accepted (handled via the detector).
+        t = make_transport(permission_prompt_tool_name="stdio")
+        t._validate_options()  # must not raise
 
     def test_sdk_mcp_server_rejected_external_allowed(self):
         from claude_agent_sdk._errors import CLIConnectionError

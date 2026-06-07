@@ -216,7 +216,13 @@ def build_command(
     if options.betas:
         cmd.extend(["--betas", ",".join(options.betas)])
 
-    if options.permission_prompt_tool_name:
+    # "stdio" is the SDK-internal sentinel set when can_use_tool is provided; it
+    # selects the stream-json control-protocol permission channel, which the
+    # interactive CLI does not understand. The PTY transport answers prompts via
+    # the TUI detector instead, so do not pass the flag for that sentinel.
+    if options.permission_prompt_tool_name and options.permission_prompt_tool_name != (
+        "stdio"
+    ):
         cmd.extend(["--permission-prompt-tool", options.permission_prompt_tool_name])
 
     if options.permission_mode:

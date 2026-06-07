@@ -10,7 +10,12 @@ control_request for the same actions (tool name, target, options), which is the
 property the live comparison harness asserts end-to-end.
 """
 
-from claude_agent_sdk._internal.transport.pty_question import parse_question
+from claude_agent_sdk._internal.transport.pty_question import (
+    DetectedQuestion,
+    QuestionOption,
+    choose_option,
+    parse_question,
+)
 
 WRITE_FRAME = [
     "● Write(note.txt)",
@@ -174,3 +179,49 @@ def test_generation_is_not_a_question() -> None:
 def test_empty_screen() -> None:
     assert parse_question([]) is None
     assert parse_question(["", "  ", ""]) is None
+
+
+def _q(*options: QuestionOption) -> DetectedQuestion:
+    return DetectedQuestion(kind="permission", question="?", options=list(options))
+
+
+def test_choose_option_allow_prefers_allow_once() -> None:
+    q = _q(
+        QuestionOption(index=1, label="Yes", action="allow_once"),
+        QuestionOption(index=2, label="Yes, always", action="allow_persist"),
+        QuestionOption(index=3, label="No", action="deny"),
+    )
+    chosen = choose_option(q, "allow")
+    assert chosen is not None and chosen.index == 1
+
+
+def test_choose_option_allow_falls_back_to_persist() -> None:
+    q = _q(
+        QuestionOption(index=1, label="Always allow", action="allow_persist"),
+        QuestionOption(index=2, label="No", action="deny"),
+    )
+    chosen = choose_option(q, "allow")
+    assert chosen is not None and chosen.index == 1
+
+
+def test_choose_option_deny_prefers_deny() -> None:
+    q = _q(
+        QuestionOption(index=1, label="Yes", action="allow_once"),
+        QuestionOption(index=2, label="No", action="deny"),
+    )
+    chosen = choose_option(q, "deny")
+    assert chosen is not None and chosen.index == 2
+
+
+def test_choose_option_deny_falls_back_to_last() -> None:
+    # No explicit deny action (e.g. a plan dialog "keep planning" last option).
+    q = _q(
+        QuestionOption(index=1, label="Proceed", action="allow_once"),
+        QuestionOption(index=2, label="Keep planning", action="select"),
+    )
+    chosen = choose_option(q, "deny")
+    assert chosen is not None and chosen.index == 2
+
+
+def test_choose_option_no_options() -> None:
+    assert choose_option(_q(), "allow") is None
