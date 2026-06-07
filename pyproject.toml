@@ -42,6 +42,11 @@ dev = [
 otel = [
     "opentelemetry-api>=1.20.0",
 ]
+pty-introspect = [
+    # Terminal emulator used by PtyCLITransport.detect_question() to
+    # reconstruct the rendered screen and parse blocking TUI dialogs.
+    "pyte>=0.8.1",
+]
 examples = [
     # Backend clients for the SessionStore reference adapters under
     # examples/session_stores/. The corresponding tests importorskip on
@@ -99,6 +104,12 @@ strict_equality = true
 # opentelemetry-api is an optional dependency (the [otel] extra); the
 # import in subprocess_cli.py is guarded by try/except ImportError.
 module = ["opentelemetry", "opentelemetry.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# pyte is an optional dependency (the [pty-introspect] extra) and ships no type
+# stubs; the imports in pty_cli.py / pty_question.py are guarded by try/except.
+module = ["pyte", "pyte.*"]
 ignore_missing_imports = true
 
 [tool.ruff]

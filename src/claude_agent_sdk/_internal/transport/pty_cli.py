@@ -59,6 +59,12 @@ from ...types import ClaudeAgentOptions
 from .._task_compat import TaskHandle, spawn_detached
 from ..sessions import _canonicalize_path, _get_projects_dir, _sanitize_path
 from . import Transport, _cli_command
+from .pty_question import (
+    SCREEN_COLS,
+    SCREEN_ROWS,
+    DetectedQuestion,
+    parse_question,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -249,6 +255,12 @@ class PtyCLITransport(Transport):
         # before producing any transcript output.
         self._recent_output = b""
 
+        # Optional terminal-screen emulator (pyte) for introspecting blocking
+        # questions rendered in the TUI. Stays None when pyte is unavailable, in
+        # which case detect_question() simply returns None.
+        self._question_screen: Any = None
+        self._question_stream: Any = None
+
         # Serializes keystroke sequences so concurrent prompts / control actions
         # don't interleave bytes into the PTY.
         self._write_lock = anyio.Lock()
@@ -290,7 +302,9 @@ class PtyCLITransport(Transport):
         # our writes are not echoed back into the transcript-tailing path.
         with contextlib.suppress(OSError):
             fcntl.ioctl(
-                slave_fd, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 120, 0, 0)
+                slave_fd,
+                termios.TIOCSWINSZ,
+                struct.pack("HHHH", SCREEN_ROWS, SCREEN_COLS, 0, 0),
             )
         with contextlib.suppress(OSError):
             tty.setraw(slave_fd)
@@ -329,6 +343,8 @@ class PtyCLITransport(Transport):
         self._out_send, self._out_recv = anyio.create_memory_object_stream[
             dict[str, Any]
         ](max_buffer_size=1000)
+
+        self._init_question_screen()
 
         self._drain_task = spawn_detached(self._drain_loop())
         self._tail_task = spawn_detached(self._tail_loop())
@@ -561,6 +577,40 @@ class PtyCLITransport(Transport):
                 break
             # Keep a bounded tail for diagnostics (e.g. early-exit error text).
             self._recent_output = (self._recent_output + data)[-4096:]
+            # Feed the terminal emulator so detect_question() can read the
+            # current screen. Defensive suppress: a malformed escape must never
+            # take down the drain loop.
+            if self._question_stream is not None:
+                with contextlib.suppress(Exception):
+                    self._question_stream.feed(data)
+
+    def _init_question_screen(self) -> None:
+        """Create the pyte screen used by detect_question(), if pyte is present.
+
+        Geometry matches the PTY winsize so the emulated screen mirrors what the
+        CLI draws. Absence of pyte is non-fatal: detect_question() returns None.
+        """
+        try:
+            import pyte
+        except ImportError:
+            self._question_screen = None
+            self._question_stream = None
+            return
+        self._question_screen = pyte.Screen(SCREEN_COLS, SCREEN_ROWS)
+        self._question_stream = pyte.ByteStream(self._question_screen)
+
+    def detect_question(self) -> DetectedQuestion | None:
+        """Return the question currently blocking the TUI, or None.
+
+        Reconstructs the rendered screen and parses any tool-permission prompt,
+        plan-approval, AskUserQuestion form, or app-level confirmation into a
+        structured :class:`DetectedQuestion`. Requires the optional ``pyte``
+        dependency (the ``pty-introspect`` extra); returns None without it.
+        """
+        screen = self._question_screen
+        if screen is None:
+            return None
+        return parse_question([line.rstrip() for line in screen.display])
 
     @staticmethod
     def _blocking_read(fd: int) -> bytes:
