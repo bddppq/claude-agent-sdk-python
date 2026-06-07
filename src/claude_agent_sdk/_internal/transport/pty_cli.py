@@ -18,8 +18,10 @@ Unsupported options (interactive mode has no equivalent SDK channel). These are
 rejected up front by :meth:`PtyCLITransport._validate_options` with an
 actionable error rather than failing silently or hanging:
 
-* ``can_use_tool`` -- tool-permission prompts render in the TUI, not over a
-  control channel the SDK can answer;
+* ``can_use_tool`` -- the interactive CLI never delivers tool-permission
+  requests to the SDK (that round-trip exists only in stream-json), so the
+  callback can never be invoked. Tools still run; they just can't be gated via
+  this callback. Use ``permission_mode`` / ``allowed_tools`` / settings instead;
 * ``hooks`` -- programmatic hook callbacks require the bidirectional protocol;
 * in-process ``mcp_servers`` of ``type="sdk"`` -- reachable only over the
   control protocol (external stdio/http/sse MCP servers still work);
@@ -354,8 +356,10 @@ class PtyCLITransport(Transport):
         unsupported: list[str] = []
         if o.can_use_tool is not None:
             unsupported.append(
-                "can_use_tool (tool-permission prompts render in the interactive "
-                "TUI; use permission_mode / allowed_tools / settings instead)"
+                "can_use_tool (the interactive CLI never sends tool-permission "
+                "requests back to the SDK -- that round-trip exists only in the "
+                "stream-json control protocol -- so the callback would never "
+                "fire; gate tools with permission_mode / allowed_tools / settings)"
             )
         if o.hooks:
             unsupported.append(
