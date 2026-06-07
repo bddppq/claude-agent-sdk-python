@@ -80,13 +80,30 @@ class TestTranslateTranscriptEntry:
         assert out["type"] == "user"
         assert out["message"]["content"][0]["type"] == "tool_result"
 
-    def test_user_text_block_list_without_tool_result_is_skipped(self):
+    def test_user_list_content_without_tool_result_is_surfaced(self):
+        # M4: structured (list) user records are surfaced even without a
+        # tool_result block -- e.g. image/document content. Only the plain-text
+        # echo of the prompt we typed (string content) is suppressed.
         entry = {
             "type": "user",
             "message": {
                 "role": "user",
                 "content": [{"type": "text", "text": "hi"}],
             },
+            "sessionId": "s-1",
+            "uuid": "u-3",
+        }
+        out = _translate_transcript_entry(entry, "fallback")
+        assert out is not None
+        assert out["type"] == "user"
+        assert out["message"]["content"][0]["type"] == "text"
+
+    def test_user_plain_string_echo_is_skipped(self):
+        # The prompt we typed is recorded as string content -> suppressed so we
+        # don't double-emit it to consumers.
+        entry = {
+            "type": "user",
+            "message": {"role": "user", "content": "the prompt I typed"},
         }
         assert _translate_transcript_entry(entry, "fallback") is None
 
@@ -203,7 +220,7 @@ class TestBuildEnv:
     def test_sets_pty_entrypoint_and_filters_claudecode(self):
         with patch.dict("os.environ", {"CLAUDECODE": "1"}):
             env = make_transport()._build_env()
-        assert env["CLAUDE_CODE_ENTRYPOINT"] == "sdk-py-pty"
+        assert env["CLAUDE_CODE_ENTRYPOINT"] == "sdk-py"
         assert "CLAUDECODE" not in env
         assert "CLAUDE_AGENT_SDK_VERSION" in env
 

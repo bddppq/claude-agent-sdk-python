@@ -135,7 +135,7 @@ class TestEnvInheritanceAndPrecedence:
     def test_sdk_managed_vars_always_set(self):
         transport = make_transport(env={})
         env = _capture_env(transport)
-        assert env.get("CLAUDE_CODE_ENTRYPOINT") == "sdk-py-pty"
+        assert env.get("CLAUDE_CODE_ENTRYPOINT") == "sdk-py"
         assert "CLAUDE_AGENT_SDK_VERSION" in env
 
     def test_options_env_cannot_override_sdk_version(self):

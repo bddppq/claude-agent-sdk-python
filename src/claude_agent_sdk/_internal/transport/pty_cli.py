@@ -156,13 +156,12 @@ def _translate_transcript_entry(
         if not isinstance(message, dict):
             return None
         content = message.get("content")
-        # Skip the echo of the prompt we typed; only surface user records that
-        # carry tool results (the structured part of a tool round-trip).
+        # Skip the echo of the plain-text prompt we typed (the CLI records the
+        # typed prompt as string content). All *structured* (list) user records
+        # are surfaced -- tool results AND non-tool-result blocks such as image /
+        # document content (M4): previously list records without a tool_result
+        # were dropped, suppressing legitimate non-tool-result user content.
         if isinstance(content, str):
-            return None
-        if isinstance(content, list) and not any(
-            isinstance(b, dict) and b.get("type") == "tool_result" for b in content
-        ):
             return None
         return {
             "type": "user",
@@ -231,7 +230,14 @@ class PtyCLITransport(Transport):
         self._cli_path: str | None = (
             str(options.cli_path) if options.cli_path is not None else None
         )
+        # ``_cwd`` is the directory we *compute the transcript path* from and is
+        # always concrete (defaults to the current process cwd, which is what the
+        # child inherits). ``_spawn_cwd`` is what we hand to Popen: None when the
+        # caller did not set cwd, so the child inherits the parent's working
+        # directory exactly as the old transport did (L2), rather than us pinning
+        # it to a snapshot of Path.cwd().
         self._cwd = str(options.cwd) if options.cwd else str(Path.cwd())
+        self._spawn_cwd = str(options.cwd) if options.cwd else None
         self._session_id = options.session_id or str(uuid.uuid4())
         # Track the live permission mode so set_permission_mode can compute how
         # many shift+tab cycles are needed to reach a target.
@@ -330,9 +336,12 @@ class PtyCLITransport(Transport):
                 stdin=slave_fd,
                 stdout=slave_fd,
                 stderr=slave_fd,
-                cwd=self._cwd,
+                # None => inherit parent's cwd (L2); only pin when caller set it.
+                cwd=self._spawn_cwd,
                 env=self._build_env(),
                 close_fds=True,
+                # Run as the configured OS user, matching the old transport (L3).
+                user=self._options.user,
                 preexec_fn=os.setsid,  # own process group so we can signal it
             )
         except FileNotFoundError as e:
@@ -481,7 +490,9 @@ class PtyCLITransport(Transport):
             )
 
     def _build_env(self) -> dict[str, str]:
-        return _cli_command.build_env(self._options, self._cwd, entrypoint="sdk-py-pty")
+        # Use the same entrypoint tag as the stream-json baseline so telemetry
+        # is not keyed differently for drop-in consumers (E1).
+        return _cli_command.build_env(self._options, self._cwd, entrypoint="sdk-py")
 
     def _ensure_onboarding_complete(self) -> None:
         """Clear interactive gates that would block programmatic input.
