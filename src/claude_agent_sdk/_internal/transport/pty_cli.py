@@ -1037,6 +1037,12 @@ class PtyCLITransport(Transport):
         # permission_denials: empty list (faithful default; stream-json always
         # sent a list, never None, so formatting that iterates it works).
         result["permission_denials"] = list(self._turn_permission_denials)
+        # structured_output: when a json_schema output_format was requested, the
+        # final assistant text is the structured JSON; parse it so the result
+        # carries structured_output like the stream-json baseline (H6).
+        structured = self._extract_structured_output()
+        if structured is not None:
+            result["structured_output"] = structured
         self._result_emitted = True
         await self._send(result)
         # Reset per-turn accumulators for the next turn.
@@ -1047,6 +1053,33 @@ class PtyCLITransport(Transport):
         self._turn_stop_reason = None
         self._turn_messages = 0
         self._turn_permission_denials = []
+
+    def _extract_structured_output(self) -> Any | None:
+        """Parse the turn's final text as structured output, if requested.
+
+        Only when ``options.output_format`` is a json_schema format -- in that
+        mode the CLI constrains the final assistant text to the schema, so the
+        text is valid JSON. Returns the parsed value, or ``None`` if no schema
+        was requested or the text is not parseable JSON.
+        """
+        of = self._options.output_format
+        if not (isinstance(of, dict) and of.get("type") == "json_schema"):
+            return None
+        text = self._turn_text.strip()
+        if not text:
+            return None
+        try:
+            return json.loads(text)
+        except (json.JSONDecodeError, ValueError):
+            # Some CLIs wrap the JSON in a fenced code block; try to recover.
+            stripped = text.strip("`").strip()
+            if stripped.startswith("json"):
+                stripped = stripped[4:].strip()
+            try:
+                return json.loads(stripped)
+            except (json.JSONDecodeError, ValueError):
+                logger.debug("structured_output text was not valid JSON")
+                return None
 
     async def _send(self, message: dict[str, Any]) -> None:
         if self._out_send is not None:

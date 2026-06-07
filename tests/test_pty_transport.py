@@ -1207,6 +1207,79 @@ class TestResultFidelity:
         assert result["is_error"] is True
         assert result["subtype"] == "error_max_turns"
 
+    def test_structured_output_parsed_when_json_schema(self, tmp_path):
+        async def _test():
+            t = make_transport(
+                output_format={
+                    "type": "json_schema",
+                    "schema": {"type": "object"},
+                }
+            )
+            path = tmp_path / "s.jsonl"
+            path.write_text(
+                "\n".join(
+                    json.dumps(line)
+                    for line in [
+                        {
+                            "type": "assistant",
+                            "sessionId": "s",
+                            "uuid": "a1",
+                            "message": {
+                                "role": "assistant",
+                                "model": "claude-opus-4-8",
+                                "content": [{"type": "text", "text": '{"answer": 42}'}],
+                            },
+                        },
+                        {"type": "system", "subtype": "turn_duration"},
+                    ]
+                )
+                + "\n"
+            )
+            t._transcript_path = path
+            t._out_send, t._out_recv = anyio.create_memory_object_stream(100)
+            t._input_ended = True
+            with anyio.fail_after(5):
+                await t._tail_loop()
+            return _drain(t)
+
+        msgs = anyio.run(_test)
+        result = next(m for m in msgs if m["type"] == "result")
+        assert result["structured_output"] == {"answer": 42}
+
+    def test_structured_output_none_without_schema(self, tmp_path):
+        async def _test():
+            t = make_transport()  # no output_format
+            path = tmp_path / "s.jsonl"
+            path.write_text(
+                "\n".join(
+                    json.dumps(line)
+                    for line in [
+                        {
+                            "type": "assistant",
+                            "sessionId": "s",
+                            "uuid": "a1",
+                            "message": {
+                                "role": "assistant",
+                                "model": "claude-opus-4-8",
+                                "content": [{"type": "text", "text": '{"x": 1}'}],
+                            },
+                        },
+                        {"type": "system", "subtype": "turn_duration"},
+                    ]
+                )
+                + "\n"
+            )
+            t._transcript_path = path
+            t._out_send, t._out_recv = anyio.create_memory_object_stream(100)
+            t._input_ended = True
+            with anyio.fail_after(5):
+                await t._tail_loop()
+            return _drain(t)
+
+        msgs = anyio.run(_test)
+        result = next(m for m in msgs if m["type"] == "result")
+        assert "structured_output" not in result
+
     def test_num_turns_uses_cli_message_count(self, tmp_path):
         # The CLI records messageCount on turn_duration; num_turns mirrors it
         # (stream-json counts API turns, not cumulative user prompts). Each turn
