@@ -64,6 +64,11 @@ _SUBMIT = b"\r"
 _INTERRUPT = b"\x1b"
 _SHIFT_TAB = b"\x1b[Z"
 
+# Seconds to let the interactive TUI render before the first prompt is typed.
+# The CLI shows a transient startup toast that swallows the first Enter; we wait
+# this long, then send one dismissal Enter. Module-level so tests can shrink it.
+_WARMUP_SECONDS = 3.0
+
 # Order the TUI cycles through on shift+tab. bypassPermissions is not part of
 # the cycle (it is only reachable via launch flag), so it cannot be set live.
 _PERMISSION_CYCLE = ("default", "acceptEdits", "plan")
@@ -630,8 +635,8 @@ class PtyCLITransport(Transport):
             return
         self._warmed_up = True
         elapsed = time.monotonic() - self._spawn_time
-        if elapsed < 3.0:
-            await anyio.sleep(3.0 - elapsed)
+        if elapsed < _WARMUP_SECONDS:
+            await anyio.sleep(_WARMUP_SECONDS - elapsed)
         await self._pty_write(_SUBMIT)  # dismiss startup toast
         await anyio.sleep(0.5)
 
