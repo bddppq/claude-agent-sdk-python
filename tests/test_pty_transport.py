@@ -610,6 +610,25 @@ class TestControlMappings:
 
         anyio.run(_test)
 
+    def test_permission_mode_record_tracks_live_mode(self, tmp_path):
+        # The CLI's permission-mode transcript record is the source of truth and
+        # corrects drift (L5) / confirms set_permission_mode (H1).
+        async def _test():
+            t = make_transport()
+            t._permission_mode = "default"
+            t._out_send, t._out_recv = anyio.create_memory_object_stream(10)
+            await t._emit_line(
+                json.dumps(
+                    {"type": "permission-mode", "permissionMode": "plan"}
+                ).encode()
+            )
+            return t
+
+        t = anyio.run(_test)
+        assert t._permission_mode == "plan"
+        # And it is not surfaced as an SDK message (bookkeeping only).
+        assert _drain(t) == []
+
     def test_set_model_types_slash_model(self):
         async def _test():
             t = make_transport()

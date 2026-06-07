@@ -94,7 +94,6 @@ _SKIP_TRANSCRIPT_TYPES = frozenset(
         "ai-title",
         "attachment",
         "mode",
-        "permission-mode",
         "file-history-snapshot",
         "summary",
     }
@@ -785,6 +784,18 @@ class PtyCLITransport(Transport):
         if not isinstance(entry, dict):
             return
         entry_type = entry.get("type")
+
+        # The CLI writes a permission-mode record whenever the live mode changes
+        # (e.g. after a shift+tab cycle or a launch flag takes effect). Use it as
+        # the source of truth for the current mode so set_permission_mode can
+        # confirm the change and does not drift (H1, L5). It is otherwise not an
+        # SDK-visible message.
+        if entry_type == "permission-mode":
+            mode = entry.get("permissionMode")
+            if isinstance(mode, str) and mode:
+                self._permission_mode = mode
+            return
+
         if entry_type in _SKIP_TRANSCRIPT_TYPES:
             return
 
@@ -1053,20 +1064,38 @@ class PtyCLITransport(Transport):
             )
         await self._warmup()
         async with self._write_lock:
-            current = _PERMISSION_CYCLE.index(self._permission_mode)
+            # Compute steps from the live mode (kept current by the
+            # permission-mode transcript records), so we don't drift from a
+            # stale assumption about the starting mode (L5).
+            start = self._permission_mode
+            current = (
+                _PERMISSION_CYCLE.index(start) if start in _PERMISSION_CYCLE else 0
+            )
             target = _PERMISSION_CYCLE.index(mode)
             steps = (target - current) % len(_PERMISSION_CYCLE)
             for _ in range(steps):
                 await self._pty_write(_SHIFT_TAB)
                 await anyio.sleep(0.1)
+        # Optimistically record the requested mode. The CLI then writes a
+        # permission-mode transcript record with the actual mode, which the tail
+        # loop reads into self._permission_mode -- so any drift (L5) or failure
+        # to apply (H1) is corrected automatically from the CLI's own state
+        # without blocking this call on a transcript round-trip.
         self._permission_mode = mode
         return None
 
     async def _set_model(self, model: str | None) -> str | None:
-        """Switch the model via the ``/model`` slash command."""
+        """Switch the model via the ``/model`` slash command.
+
+        The interactive ``/model`` command applies the change; subsequent
+        assistant messages in the transcript carry the new ``model`` id, which
+        the tail loop records as ``self._turn_model``. We optimistically track
+        the requested model so a follow-up set_model computes from it.
+        """
         if not model:
             return None
         await self._run_slash_command(f"/model {model}")
+        self._turn_model = model
         return None
 
     async def _run_slash_command(self, command: str) -> None:
