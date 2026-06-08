@@ -67,6 +67,7 @@ from ...types import (
 from .._task_compat import TaskHandle, spawn_detached
 from ..sessions import _canonicalize_path, _get_projects_dir, _sanitize_path
 from . import Transport, _cli_command
+from ._api_monitor import ApiMonitor
 from ._usage import TurnUsageAccumulator
 from .pty_question import (
     SCREEN_COLS,
@@ -383,6 +384,31 @@ class PtyCLITransport(Transport):
         # the belt-and-suspenders guard).
         self._seen_assistant_ids: set[str] = set()
 
+        # ----- API monitor (always-on pure-relay proxy) ----------------- #
+        # The transport interposes a loopback proxy between the CLI and the real
+        # Anthropic API (see _api_monitor). It forwards bytes UNCHANGED and tees
+        # a copy of each /v1/messages call so we can enrich the result with data
+        # the transcript cannot show: per-call usage for ALL calls including the
+        # auxiliary helper-model (e.g. haiku title) call the transcript never
+        # records (C1/R3), real per-call API durations (R7), HTTP error statuses
+        # (C1), and the FULL tool_use.input while a permission dialog blocks
+        # (RV2). ALWAYS ON -- no config/env toggle; it is simply how connect()
+        # launches the CLI. The monitor is None only if start() failed (a
+        # non-fatal degradation: turns still run, just without the enrichment).
+        self._api_monitor: ApiMonitor | None = None
+        # /v1/messages call records observed in the current turn (one dict per
+        # call, in arrival order). Consumed when synthesizing the result.
+        self._turn_api_calls: list[dict[str, Any]] = []
+        # Full tool inputs recovered from intercepted responses this turn, keyed
+        # by tool_use_id -> {name, input}. Used to supply the FULL input to a
+        # blocking can_use_tool dialog (RV2), correlating by tool_use_id or, when
+        # the TUI only exposes a tool name, by the latest input seen for it.
+        self._turn_tool_inputs: dict[str, dict[str, Any]] = {}
+        # Most-recently-seen full input per tool NAME (RV2 correlation fallback:
+        # while a permission dialog blocks the TUI exposes only the tool name,
+        # not its id, but the tool_use is already in the intercepted response).
+        self._turn_tool_input_by_name: dict[str, dict[str, Any]] = {}
+
     # ------------------------------------------------------------------ #
     # Connection lifecycle
     # ------------------------------------------------------------------ #
@@ -403,6 +429,11 @@ class PtyCLITransport(Transport):
         # block programmatic input. Mark onboarding complete so the CLI drops
         # straight into the prompt. Best-effort and non-destructive.
         await anyio.to_thread.run_sync(self._ensure_onboarding_complete)
+
+        # Start the always-on API monitor BEFORE building the env so the child's
+        # ANTHROPIC_BASE_URL can be pointed at the loopback proxy (RV2/C1/R3/R7).
+        # Must happen before Popen consumes _build_env().
+        await self._start_api_monitor()
 
         cmd = self._build_command()
 
@@ -656,7 +687,66 @@ class PtyCLITransport(Transport):
     def _build_env(self) -> dict[str, str]:
         # Use the same entrypoint tag as the stream-json baseline so telemetry
         # is not keyed differently for drop-in consumers (E1).
-        return _cli_command.build_env(self._options, self._cwd, entrypoint="sdk-py")
+        env = _cli_command.build_env(self._options, self._cwd, entrypoint="sdk-py")
+        # Always-on API monitor: point the CHILD CLI at the loopback proxy so its
+        # /v1/messages traffic is observed (and forwarded UNCHANGED to the real
+        # upstream the proxy captured from the original ANTHROPIC_BASE_URL). The
+        # user never sees this. If the monitor failed to start, leave the env as
+        # is so the CLI talks to the real API directly (non-fatal degradation).
+        if self._api_monitor is not None:
+            env["ANTHROPIC_BASE_URL"] = self._api_monitor.base_url
+        return env
+
+    def _upstream_base_url(self) -> str:
+        """The real upstream the monitor forwards to.
+
+        Read from the CURRENT ANTHROPIC_BASE_URL (options.env wins over the
+        process env), defaulting to the public API. This is captured BEFORE we
+        overwrite the child's value with the loopback proxy, so the proxy always
+        forwards to wherever the CLI would have gone unmonitored.
+        """
+        return (
+            self._options.env.get("ANTHROPIC_BASE_URL")
+            or os.environ.get("ANTHROPIC_BASE_URL")
+            or "https://api.anthropic.com"
+        )
+
+    async def _start_api_monitor(self) -> None:
+        """Start the loopback pure-relay API monitor (always on; non-fatal)."""
+        try:
+            monitor = ApiMonitor(self._upstream_base_url(), self._on_api_call)
+            await monitor.start()
+            self._api_monitor = monitor
+        except Exception:
+            # Never let monitor startup break the turn -- fall back to the CLI
+            # talking to the real API directly (just without the enrichment).
+            logger.debug("API monitor failed to start; continuing", exc_info=True)
+            self._api_monitor = None
+
+    def _on_api_call(self, record: dict[str, Any]) -> None:
+        """Receive one observed /v1/messages call from the monitor (best-effort).
+
+        Runs on the monitor's serve task after the bytes were already forwarded,
+        so it can never affect the relay. Everything here is wrapped so a bad
+        record cannot crash the monitor. We accumulate per-turn so the result can
+        compute exact cost/usage across ALL calls (incl. helper-model calls),
+        real api duration, and error statuses, and recover full tool inputs.
+        """
+        try:
+            self._turn_api_calls.append(record)
+            for block in record.get("content_blocks") or []:
+                if not isinstance(block, dict) or block.get("type") != "tool_use":
+                    continue
+                tid = block.get("id")
+                name = block.get("name")
+                inp = block.get("input")
+                entry = {"name": name, "input": inp}
+                if isinstance(tid, str) and tid:
+                    self._turn_tool_inputs[tid] = entry
+                if isinstance(name, str) and name:
+                    self._turn_tool_input_by_name[name] = entry
+        except Exception:
+            logger.debug("API monitor record handling failed", exc_info=True)
 
     def _ensure_onboarding_complete(self) -> None:
         """Clear interactive gates that would block programmatic input.
@@ -971,14 +1061,24 @@ class PtyCLITransport(Transport):
         """
         callback = self._options.can_use_tool
         if callback is not None and question.tool:
+            # RV2: prefer the FULL tool_use.input recovered from the intercepted
+            # API response over the TUI's scraped {target}. While the dialog
+            # blocks, the transcript has no tool_use record yet -- but the API
+            # monitor has already seen the assistant's tool_use in the /v1/
+            # messages response, so we correlate by tool name to supply the real,
+            # complete input (and tool_use_id) the baseline passes.
+            full_input, tool_use_id = self._recover_tool_input(question.tool)
             context = ToolPermissionContext(
-                tool_use_id=None,
+                tool_use_id=tool_use_id,
                 title=question.question,
                 display_name=question.tool,
             )
-            tool_input: dict[str, Any] = (
-                {"target": question.target} if question.target else {}
-            )
+            if full_input is not None:
+                tool_input: dict[str, Any] = full_input
+            else:
+                # Fall back to the scraped target when the monitor saw nothing
+                # (e.g. it failed to start, or the call hasn't landed yet).
+                tool_input = {"target": question.target} if question.target else {}
             try:
                 result = await callback(question.tool, tool_input, context)
             except Exception:
@@ -991,6 +1091,38 @@ class PtyCLITransport(Transport):
         # in modes that gate; consumers that need gating should pass can_use_tool
         # or use disallowed_tools / a restrictive permission mode.
         return "allow"
+
+    def _recover_tool_input(
+        self, tool_name: str
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        """Recover the FULL tool input + tool_use_id for a blocking dialog (RV2).
+
+        The intercepted /v1/messages response carried the assistant's ``tool_use``
+        block (id, name, full input) before the TUI dialog finished blocking, so
+        we look it up by the dialog's tool name. Returns ``(input, tool_use_id)``
+        -- either may be ``None`` if nothing matched or the input was not a dict.
+        Correlation is by name (the dialog exposes only the name, not the id);
+        the latest tool_use seen for that name wins, which is correct because the
+        dialog blocks on the most recent tool call.
+        """
+        # Prefer the by-name index (latest input per tool name).
+        entry = self._turn_tool_input_by_name.get(tool_name)
+        tool_use_id: str | None = None
+        if entry is None:
+            # Fall back to scanning the id-keyed index for a matching name.
+            for tid, e in self._turn_tool_inputs.items():
+                if e.get("name") == tool_name:
+                    entry = e
+                    tool_use_id = tid
+            if entry is None:
+                return None, None
+        else:
+            for tid, e in self._turn_tool_inputs.items():
+                if e is entry:
+                    tool_use_id = tid
+                    break
+        inp = entry.get("input")
+        return (inp if isinstance(inp, dict) else None), tool_use_id
 
     async def _send_option_choice(self, option: QuestionOption) -> None:
         """Answer a numbered dialog by typing the option digit then Enter."""
@@ -1322,6 +1454,106 @@ class PtyCLITransport(Transport):
                 return "error_max_budget_usd"
         return "error_during_execution"
 
+    def _traffic_usage(self) -> TurnUsageAccumulator | None:
+        """Build a usage accumulator from the turn's intercepted /v1/messages.
+
+        This is the AUTHORITATIVE usage/cost source (C1/R3): unlike the
+        transcript -- which records only the primary assistant messages -- the
+        captured traffic includes EVERY API call in the turn, including the
+        auxiliary helper-model call (e.g. haiku title generation) the transcript
+        never shows. So summing per-call usage here closes the helper-line gap
+        that made the PTY total under-report vs the baseline.
+
+        Each intercepted call is one COMPLETE request/response (the proxy reads
+        each connection once -- there are no streamed snapshots to dedup the way
+        the transcript has), so every call gets a distinct synthetic key and is
+        counted exactly once. Returns ``None`` when no call carried usage (the
+        caller then falls back to the transcript-based accumulator).
+        """
+        if not self._turn_api_calls:
+            return None
+        acc = TurnUsageAccumulator()
+        found = False
+        for i, call in enumerate(self._turn_api_calls):
+            usage = call.get("usage")
+            if not isinstance(usage, dict) or not usage:
+                continue
+            model = call.get("model")
+            acc.add(f"_call_{i}", model if isinstance(model, str) else None, usage)
+            found = True
+        return acc if found else None
+
+    def _duration_api_ms(self) -> int | None:
+        """Sum the real per-call request->response durations (R7).
+
+        Returns ``None`` when no traffic was observed (the caller then falls back
+        to the wall-clock duration, as before).
+        """
+        if not self._turn_api_calls:
+            return None
+        total = 0
+        any_timed = False
+        for call in self._turn_api_calls:
+            d = call.get("duration_ms")
+            if isinstance(d, (int, float)):
+                total += int(d)
+                any_timed = True
+        return total if any_timed else None
+
+    def _terminal_api_error_status(self) -> int | None:
+        """The HTTP status if the turn's LAST API call was a non-2xx error (C1).
+
+        Mirrors the baseline's ``api_error_status``: the status of the API error
+        the turn ENDED on. A transient non-2xx (e.g. a 429 the CLI then retried
+        successfully) is deliberately NOT surfaced -- it is followed by a 2xx, so
+        the last call is 2xx and the turn did not fail on it. Returns ``None``
+        when the final observed call succeeded or no calls were observed.
+        """
+        if not self._turn_api_calls:
+            return None
+        last_status = self._turn_api_calls[-1].get("status")
+        if (
+            isinstance(last_status, int)
+            and last_status
+            and not (200 <= last_status < 300)
+        ):
+            return last_status
+        return None
+
+    def _apply_usage_fields(self, result: dict[str, Any]) -> None:
+        """Populate usage/cost/model_usage + duration_api_ms + api error status.
+
+        Prefers the intercepted-traffic usage (authoritative, includes the
+        helper-model call -- C1/R3) and falls back to the transcript-derived
+        accumulator when no traffic was observed (e.g. the monitor failed to
+        start). Also overrides ``duration_api_ms`` with the real summed per-call
+        API time when available (R7) and surfaces any non-2xx statuses (C1).
+        """
+        usage_acc = self._traffic_usage() or (
+            self._turn_usage if self._turn_usage.has_data() else None
+        )
+        if usage_acc is not None and usage_acc.has_data():
+            result["usage"] = usage_acc.aggregate_usage()
+            cost = usage_acc.total_cost()
+            if cost is not None:
+                result["total_cost_usd"] = cost
+            model_usage = usage_acc.model_usage()
+            if model_usage is not None:
+                # camelCase ``modelUsage`` wire key so message_parser picks it up
+                # (R1); snake_case made ResultMessage.model_usage always None.
+                result["modelUsage"] = model_usage
+
+        api_ms = self._duration_api_ms()
+        if api_ms is not None:
+            result["duration_api_ms"] = api_ms
+
+        # api_error_status: only when the turn ended on a non-2xx API call (a
+        # retried-then-recovered transient is not a turn failure) -- matches the
+        # baseline field message_parser reads (C1).
+        error_status = self._terminal_api_error_status()
+        if error_status is not None:
+            result["api_error_status"] = error_status
+
     async def _emit_result(self, entry: dict[str, Any]) -> None:
         """Synthesize and emit a result from a ``turn_duration`` record."""
         # A deny (RR1) or interrupt (R4) may have already emitted a terminating
@@ -1346,8 +1578,9 @@ class PtyCLITransport(Transport):
             "type": "result",
             "subtype": subtype,
             "duration_ms": duration,
-            # No per-API duration is recorded in the transcript; the turn's
-            # wall-clock duration is the closest faithful value.
+            # duration_api_ms defaults to the wall-clock duration; _apply_usage_
+            # fields overrides it with the real summed per-call API time when the
+            # monitor observed the traffic (R7).
             "duration_api_ms": duration,
             "is_error": self._turn_is_error,
             "num_turns": num_turns,
@@ -1358,19 +1591,9 @@ class PtyCLITransport(Transport):
             "stop_reason": self._turn_stop_reason,
             "uuid": entry.get("uuid"),
         }
-        if self._turn_usage.has_data():
-            result["usage"] = self._turn_usage.aggregate_usage()
-            cost = self._turn_usage.total_cost()
-            if cost is not None:
-                result["total_cost_usd"] = cost
-            model_usage = self._turn_usage.model_usage()
-            if model_usage is not None:
-                # Emit under the camelCase ``modelUsage`` wire key: the real CLI
-                # uses that key and ``message_parser.parse_message`` reads
-                # ``data.get("modelUsage")`` (R1). Writing snake_case
-                # ``model_usage`` here made ``ResultMessage.model_usage`` always
-                # None at the consumer.
-                result["modelUsage"] = model_usage
+        # usage/cost/model_usage (C1/R3), real duration_api_ms (R7), and any
+        # non-2xx api status (C1) -- preferring the intercepted traffic.
+        self._apply_usage_fields(result)
         # permission_denials: empty list (faithful default; stream-json always
         # sent a list, never None, so formatting that iterates it works).
         result["permission_denials"] = list(self._turn_permission_denials)
@@ -1399,6 +1622,10 @@ class PtyCLITransport(Transport):
         self._denied_tool_use_ids = set()
         self._deny_terminated = False
         self._turn_start_time = None
+        # API-monitor per-turn accumulators (traffic-derived enrichment).
+        self._turn_api_calls = []
+        self._turn_tool_inputs = {}
+        self._turn_tool_input_by_name = {}
 
     async def _emit_interrupt_result(self) -> None:
         """Synthesize a terminating result after an ``interrupt`` (R4).
@@ -1441,14 +1668,9 @@ class PtyCLITransport(Transport):
             "stop_reason": None,
             "uuid": str(uuid.uuid4()),
         }
-        if self._turn_usage.has_data():
-            result["usage"] = self._turn_usage.aggregate_usage()
-            cost = self._turn_usage.total_cost()
-            if cost is not None:
-                result["total_cost_usd"] = cost
-            model_usage = self._turn_usage.model_usage()
-            if model_usage is not None:
-                result["modelUsage"] = model_usage
+        # usage/cost/model_usage (C1/R3) + real duration_api_ms (R7) + api error
+        # status (C1) from whatever traffic completed before the abort.
+        self._apply_usage_fields(result)
         result["permission_denials"] = list(self._turn_permission_denials)
         self._result_emitted = True
         await self._send(result)
@@ -1495,14 +1717,9 @@ class PtyCLITransport(Transport):
             "stop_reason": self._turn_stop_reason,
             "uuid": str(uuid.uuid4()),
         }
-        if self._turn_usage.has_data():
-            result["usage"] = self._turn_usage.aggregate_usage()
-            cost = self._turn_usage.total_cost()
-            if cost is not None:
-                result["total_cost_usd"] = cost
-            model_usage = self._turn_usage.model_usage()
-            if model_usage is not None:
-                result["modelUsage"] = model_usage
+        # usage/cost/model_usage (C1/R3) + real duration_api_ms (R7) + api error
+        # status (C1), preferring the intercepted traffic.
+        self._apply_usage_fields(result)
         result["permission_denials"] = list(self._turn_permission_denials)
         structured = self._extract_structured_output()
         if structured is not None:
@@ -1900,6 +2117,13 @@ class PtyCLITransport(Transport):
         self._tail_task = None
         self._drain_task = None
         self._question_task = None
+
+        # Stop the always-on API monitor (safe from any task -- it uses a
+        # detached serve handle, not a task-affine cancel scope).
+        if self._api_monitor is not None:
+            with contextlib.suppress(Exception):
+                await self._api_monitor.stop()
+            self._api_monitor = None
 
         if self._out_send is not None:
             with contextlib.suppress(Exception):

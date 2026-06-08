@@ -2266,3 +2266,242 @@ class TestSeenUuidsBounded:
 
         size = anyio.run(_test)
         assert size <= pty_cli._SEEN_UUIDS_MAX
+
+
+# --------------------------------------------------------------------------- #
+# API-monitor traffic enrichment (C1 / R3 / R7 / RV2)
+# --------------------------------------------------------------------------- #
+
+
+class TestApiMonitorEnrichment:
+    """The transport enriches the result from intercepted /v1/messages traffic.
+
+    These drive the transport's monitor callback directly with synthetic call
+    records (no sockets, no model) and assert the synthesized result reflects the
+    captured traffic: cost/usage summed across ALL calls including the helper
+    model (C1/R3), real summed api duration (R7), and non-2xx status (C1).
+    """
+
+    def _opus_call(self) -> dict:
+        return {
+            "path": "/v1/messages",
+            "method": "POST",
+            "status": 200,
+            "duration_ms": 1200,
+            "model": "claude-opus-4-8",
+            "request": {"model": "claude-opus-4-8"},
+            "usage": {"input_tokens": 1_000_000, "output_tokens": 0},
+            "stop_reason": "end_turn",
+            "content_blocks": [{"type": "text", "text": "done"}],
+            "partial_text": "done",
+        }
+
+    def _haiku_helper_call(self) -> dict:
+        # The auxiliary title-generation call the transcript NEVER records (R3).
+        return {
+            "path": "/v1/messages",
+            "method": "POST",
+            "status": 200,
+            "duration_ms": 300,
+            "model": "claude-haiku-4-5",
+            "request": {"model": "claude-haiku-4-5"},
+            "usage": {"input_tokens": 1_000_000, "output_tokens": 0},
+            "stop_reason": "end_turn",
+            "content_blocks": [{"type": "text", "text": "A title"}],
+            "partial_text": "A title",
+        }
+
+    def test_cost_and_model_usage_include_helper_call(self, tmp_path):
+        async def _test():
+            t = make_transport()
+            t._out_send, t._out_recv = anyio.create_memory_object_stream(10)
+            # Simulate the monitor observing the opus turn + the haiku helper.
+            t._on_api_call(self._opus_call())
+            t._on_api_call(self._haiku_helper_call())
+            await t._emit_result(
+                {"type": "system", "subtype": "turn_duration", "durationMs": 9}
+            )
+            return _drain(t)
+
+        msgs = anyio.run(_test)
+        result = next(m for m in msgs if m["type"] == "result")
+        # opus 1M input @ $5/Mtok = 5.0; haiku 1M input @ $1/Mtok = 1.0 -> 6.0.
+        assert result["total_cost_usd"] == pytest.approx(6.0)
+        # Both models appear in model_usage -- the helper line is no longer lost.
+        assert set(result["modelUsage"].keys()) == {
+            "claude-opus-4-8",
+            "claude-haiku-4-5",
+        }
+        assert result["modelUsage"]["claude-haiku-4-5"]["costUSD"] == pytest.approx(1.0)
+        # usage summed across BOTH calls.
+        assert result["usage"]["input_tokens"] == 2_000_000
+
+    def test_duration_api_ms_is_summed_real_timing(self, tmp_path):
+        async def _test():
+            t = make_transport()
+            t._out_send, t._out_recv = anyio.create_memory_object_stream(10)
+            t._on_api_call(self._opus_call())  # 1200ms
+            t._on_api_call(self._haiku_helper_call())  # 300ms
+            await t._emit_result(
+                {"type": "system", "subtype": "turn_duration", "durationMs": 9}
+            )
+            return _drain(t)
+
+        msgs = anyio.run(_test)
+        result = next(m for m in msgs if m["type"] == "result")
+        # Real summed per-call API time (R7), not the wall-clock durationMs (9).
+        assert result["duration_api_ms"] == 1500
+        assert result["duration_ms"] == 9
+
+    def test_terminal_api_error_status_surfaced(self, tmp_path):
+        # The turn ENDS on a non-2xx call -> surface it (C1).
+        async def _test():
+            t = make_transport()
+            t._out_send, t._out_recv = anyio.create_memory_object_stream(10)
+            t._on_api_call(self._opus_call())  # a 200
+            err = self._opus_call()
+            err["status"] = 529  # overloaded -- the LAST call fails
+            err["usage"] = None
+            t._on_api_call(err)
+            await t._emit_result(
+                {"type": "system", "subtype": "turn_duration", "durationMs": 9}
+            )
+            return _drain(t)
+
+        msgs = anyio.run(_test)
+        result = next(m for m in msgs if m["type"] == "result")
+        assert result["api_error_status"] == 529
+
+    def test_recovered_transient_error_not_surfaced(self, tmp_path):
+        # A 529 the CLI then retried successfully (last call is 200) is NOT a
+        # turn failure, so api_error_status is not set (faithful to baseline).
+        async def _test():
+            t = make_transport()
+            t._out_send, t._out_recv = anyio.create_memory_object_stream(10)
+            err = self._opus_call()
+            err["status"] = 529
+            err["usage"] = None
+            t._on_api_call(err)
+            t._on_api_call(self._opus_call())  # 200 retry succeeds
+            await t._emit_result(
+                {"type": "system", "subtype": "turn_duration", "durationMs": 9}
+            )
+            return _drain(t)
+
+        msgs = anyio.run(_test)
+        result = next(m for m in msgs if m["type"] == "result")
+        assert result.get("api_error_status") is None
+
+    def test_falls_back_to_transcript_usage_without_traffic(self, tmp_path):
+        # When the monitor observed nothing (no traffic), the result still uses
+        # the transcript-derived accumulator -- no regression.
+        async def _test():
+            t = make_transport()
+            t._out_send, t._out_recv = anyio.create_memory_object_stream(10)
+            t._turn_usage.add(
+                "msg_1",
+                "claude-opus-4-8",
+                {"input_tokens": 1_000_000, "output_tokens": 0},
+            )
+            await t._emit_result(
+                {"type": "system", "subtype": "turn_duration", "durationMs": 9}
+            )
+            return _drain(t)
+
+        msgs = anyio.run(_test)
+        result = next(m for m in msgs if m["type"] == "result")
+        assert result["total_cost_usd"] == pytest.approx(5.0)
+        # No traffic -> duration_api_ms stays the wall-clock fallback.
+        assert result["duration_api_ms"] == 9
+
+
+class TestRecoverToolInputRV2:
+    """RV2: can_use_tool receives the FULL tool input from intercepted traffic."""
+
+    def test_full_input_recovered_by_tool_name(self):
+        t = make_transport()
+        # Simulate the monitor observing the assistant's tool_use in the response
+        # while the permission dialog is still blocking.
+        t._on_api_call(
+            {
+                "path": "/v1/messages",
+                "method": "POST",
+                "status": 200,
+                "duration_ms": 5,
+                "model": "claude-opus-4-8",
+                "request": {"model": "claude-opus-4-8"},
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+                "stop_reason": "tool_use",
+                "content_blocks": [
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_42",
+                        "name": "Write",
+                        "input": {"file_path": "/tmp/x.txt", "content": "hi"},
+                    }
+                ],
+                "partial_text": "",
+            }
+        )
+        full_input, tool_use_id = t._recover_tool_input("Write")
+        assert full_input == {"file_path": "/tmp/x.txt", "content": "hi"}
+        assert tool_use_id == "toolu_42"
+
+    def test_unknown_tool_returns_none(self):
+        t = make_transport()
+        assert t._recover_tool_input("Write") == (None, None)
+
+    def test_decide_permission_passes_full_input_to_callback(self):
+        from claude_agent_sdk import PermissionResultAllow
+        from claude_agent_sdk._internal.transport.pty_question import (
+            DetectedQuestion,
+            QuestionOption,
+        )
+
+        seen: dict = {}
+
+        async def cb(tool_name, tool_input, context):
+            seen["name"] = tool_name
+            seen["input"] = tool_input
+            seen["tool_use_id"] = context.tool_use_id
+            return PermissionResultAllow()
+
+        async def _test():
+            t = make_transport(can_use_tool=cb)
+            t._on_api_call(
+                {
+                    "path": "/v1/messages",
+                    "method": "POST",
+                    "status": 200,
+                    "duration_ms": 5,
+                    "model": "claude-opus-4-8",
+                    "request": {},
+                    "usage": {"input_tokens": 1, "output_tokens": 1},
+                    "stop_reason": "tool_use",
+                    "content_blocks": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_99",
+                            "name": "Bash",
+                            "input": {"command": "ls -la /etc"},
+                        }
+                    ],
+                    "partial_text": "",
+                }
+            )
+            question = DetectedQuestion(
+                kind="permission",
+                tool="Bash",
+                target="ls",  # the TUI's scraped (partial) signal
+                question="Allow Bash?",
+                options=[QuestionOption(index=1, label="Yes")],
+            )
+            decision = await t._decide_permission(question)
+            return decision
+
+        decision = anyio.run(_test)
+        assert decision == "allow"
+        # The callback got the FULL input (RV2), not the scraped {target:'ls'}.
+        assert seen["input"] == {"command": "ls -la /etc"}
+        assert seen["tool_use_id"] == "toolu_99"
+        assert seen["name"] == "Bash"
