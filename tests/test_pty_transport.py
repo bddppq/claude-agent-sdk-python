@@ -905,7 +905,11 @@ class TestPermissionAnswering:
 
         anyio.run(_test)
 
-    def test_can_use_tool_deny_selects_deny_and_records_denial(self):
+    def test_can_use_tool_deny_selects_deny_and_queues_pending(self):
+        # The denial entry is no longer built from the screen-scraped target;
+        # it is deferred and correlated to the rejected tool_result in the
+        # transcript (RR2). Answering deny queues the tool name and marks the
+        # turn deny-terminated (RR1).
         async def _test():
             from claude_agent_sdk import PermissionResultDeny
 
@@ -917,9 +921,10 @@ class TestPermissionAnswering:
             await t._answer_question(self._permission_question())
             joined = b"".join(writes)
             assert b"2" in joined  # deny option
-            assert t._turn_permission_denials == [
-                {"tool_name": "Write", "tool_input": {"target": "note.txt"}}
-            ]
+            assert t._pending_denied_tools == ["Write"]
+            assert t._deny_terminated is True
+            # No synthetic {target:...} entry recorded at answer time.
+            assert t._turn_permission_denials == []
 
         anyio.run(_test)
 
@@ -1431,11 +1436,199 @@ class TestResultFidelity:
             t._out_send, t._out_recv = anyio.create_memory_object_stream(100)
             for x in lines:
                 await t._emit_line(json.dumps(x).encode())
+                # _emit_result now no-ops if a result was already emitted for the
+                # turn (deny/interrupt double-emit guard); in real usage
+                # _type_prompt resets this between turns, so mirror that here.
+                if x.get("subtype") == "turn_duration":
+                    t._result_emitted = False
             return _drain(t)
 
         msgs = anyio.run(_test)
         results = [m for m in msgs if m["type"] == "result"]
         assert [r["num_turns"] for r in results] == [2, 4]
+
+
+class TestDenyTermination:
+    """RR1/RR2/RR5: a can_use_tool deny terminates the turn faithfully."""
+
+    @staticmethod
+    def _deny_transcript():
+        # An assistant tool_use followed by the rejected (is_error) tool_result
+        # the CLI writes after a deny. No turn_duration record is ever written
+        # (the CLI goes idle), mirroring the live behavior.
+        assistant = {
+            "type": "assistant",
+            "sessionId": "s",
+            "uuid": "a1",
+            "message": {
+                "role": "assistant",
+                "id": "msg_1",
+                "model": "claude-opus-4-8",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_abc",
+                        "name": "Write",
+                        "input": {"file_path": "/tmp/note.txt", "content": "hello"},
+                    }
+                ],
+            },
+        }
+        rejected = {
+            "type": "user",
+            "sessionId": "s",
+            "uuid": "u1",
+            "message": {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_abc",
+                        "is_error": True,
+                        "content": "denied",
+                    }
+                ],
+            },
+        }
+        return assistant, rejected
+
+    def test_deny_emits_terminating_result(self):
+        # RR1: after a deny the CLI writes no turn_duration; the transport must
+        # synthesize a terminating result (subtype=success, is_error=False) so
+        # receive_response() does not deadlock.
+        async def _test():
+            t = make_transport()
+            t._out_send, t._out_recv = anyio.create_memory_object_stream(100)
+            # Simulate the watcher having answered "deny" for Write.
+            t._pending_denied_tools = ["Write"]
+            t._deny_terminated = True
+            assistant, rejected = self._deny_transcript()
+            await t._emit_line(json.dumps(assistant).encode())
+            await t._emit_line(json.dumps(rejected).encode())
+            return _drain(t)
+
+        msgs = anyio.run(_test)
+        results = [m for m in msgs if m["type"] == "result"]
+        assert len(results) == 1
+        r = results[0]
+        assert r["subtype"] == "success"
+        assert r["is_error"] is False
+
+    def test_deny_records_baseline_denial_shape(self):
+        # RR2: permission_denials carries {tool_name, tool_use_id, tool_input}
+        # with the real id and full original input recovered from the transcript.
+        async def _test():
+            t = make_transport()
+            t._out_send, t._out_recv = anyio.create_memory_object_stream(100)
+            t._pending_denied_tools = ["Write"]
+            t._deny_terminated = True
+            assistant, rejected = self._deny_transcript()
+            await t._emit_line(json.dumps(assistant).encode())
+            await t._emit_line(json.dumps(rejected).encode())
+            return _drain(t)
+
+        msgs = anyio.run(_test)
+        r = [m for m in msgs if m["type"] == "result"][0]
+        assert r["permission_denials"] == [
+            {
+                "tool_name": "Write",
+                "tool_use_id": "toolu_abc",
+                "tool_input": {"file_path": "/tmp/note.txt", "content": "hello"},
+            }
+        ]
+
+    def test_deny_excludes_rejected_tool_result_from_num_turns(self):
+        # RR5: the rejected tool_result is not a real round-trip, so num_turns
+        # is 1 (just the turn), not 2.
+        async def _test():
+            t = make_transport()
+            t._out_send, t._out_recv = anyio.create_memory_object_stream(100)
+            t._pending_denied_tools = ["Write"]
+            t._deny_terminated = True
+            assistant, rejected = self._deny_transcript()
+            await t._emit_line(json.dumps(assistant).encode())
+            await t._emit_line(json.dumps(rejected).encode())
+            return _drain(t)
+
+        msgs = anyio.run(_test)
+        r = [m for m in msgs if m["type"] == "result"][0]
+        assert r["num_turns"] == 1
+
+    def test_deny_does_not_double_emit_on_late_turn_duration(self):
+        # If a turn_duration somehow arrives after the deny result, no second
+        # result is emitted.
+        async def _test():
+            t = make_transport()
+            t._out_send, t._out_recv = anyio.create_memory_object_stream(100)
+            t._pending_denied_tools = ["Write"]
+            t._deny_terminated = True
+            assistant, rejected = self._deny_transcript()
+            await t._emit_line(json.dumps(assistant).encode())
+            await t._emit_line(json.dumps(rejected).encode())
+            await t._emit_line(
+                json.dumps(
+                    {"type": "system", "subtype": "turn_duration", "uuid": "td"}
+                ).encode()
+            )
+            return _drain(t)
+
+        msgs = anyio.run(_test)
+        assert len([m for m in msgs if m["type"] == "result"]) == 1
+
+    def test_non_deny_error_tool_result_still_counts(self):
+        # A genuine tool error (not a permission deny) is a real round-trip and
+        # is NOT recorded as a denial.
+        async def _test():
+            t = make_transport()
+            t._out_send, t._out_recv = anyio.create_memory_object_stream(100)
+            # No pending deny -> the error tool_result is a normal round-trip.
+            assistant, rejected = self._deny_transcript()
+            await t._emit_line(json.dumps(assistant).encode())
+            await t._emit_line(json.dumps(rejected).encode())
+            await t._emit_line(
+                json.dumps(
+                    {"type": "system", "subtype": "turn_duration", "uuid": "td"}
+                ).encode()
+            )
+            return _drain(t)
+
+        msgs = anyio.run(_test)
+        r = [m for m in msgs if m["type"] == "result"][0]
+        assert r["permission_denials"] == []
+        assert r["num_turns"] == 2  # the error tool_result counts as a round-trip
+
+
+class TestPerTurnInit:
+    """RR4: a fresh system/init message leads every turn."""
+
+    def test_init_emitted_before_each_subsequent_turn(self):
+        async def _test():
+            t = make_transport()
+            t._ready = True
+            t._out_send, t._out_recv = anyio.create_memory_object_stream(100)
+            # connect() already emitted the turn-1 init; subsequent turns get one
+            # from _type_prompt. Simulate three prompt submissions.
+            import unittest.mock as mock
+
+            with (
+                mock.patch.object(t, "_warmup", new=_noop),
+                mock.patch.object(t, "_pty_write", new=_noop),
+            ):
+                for _ in range(3):
+                    await t._type_prompt("hi")
+            return _drain(t)
+
+        msgs = anyio.run(_test)
+        inits = [
+            m for m in msgs if m.get("type") == "system" and m.get("subtype") == "init"
+        ]
+        # Turn 1's init is emitted at connect (not exercised here); turns 2 and 3
+        # each emit one from _type_prompt.
+        assert len(inits) == 2
+
+
+async def _noop(*args, **kwargs):
+    return None
 
 
 # --------------------------------------------------------------------------- #

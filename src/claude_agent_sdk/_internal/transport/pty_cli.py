@@ -304,6 +304,10 @@ class PtyCLITransport(Transport):
         # Serializes keystroke sequences so concurrent prompts / control actions
         # don't interleave bytes into the PTY.
         self._write_lock = anyio.Lock()
+        # Number of prompts submitted so far. The init message for turn 1 is
+        # emitted at connect(); a fresh system/init is emitted before each
+        # subsequent prompt to match the baseline's per-turn ordering (RR4).
+        self._submitted_turns = 0
         # Per-turn state used to synthesize a faithful ``result`` message.
         self._turn_count = 0
         self._turn_text = ""
@@ -324,6 +328,25 @@ class PtyCLITransport(Transport):
         # Permission denials observed in the current turn (answered "deny" via
         # the TUI question detector). Surfaced on the result like stream-json.
         self._turn_permission_denials: list[dict[str, Any]] = []
+        # Tool names denied via can_use_tool this turn but not yet correlated to
+        # the rejected tool_result transcript record. The TUI dialog only exposes
+        # a target string, so we recover the real tool_use_id and full input by
+        # matching the rejected ``tool_result`` (is_error) back to its
+        # ``tool_use`` block (RR2). FIFO so repeated denials of the same tool keep
+        # order.
+        self._pending_denied_tools: list[str] = []
+        # tool_use blocks seen this turn, keyed by tool_use id -> {name, input}.
+        # Used to recover the full original input + id for a denial (RR2) and to
+        # identify which rejected tool_results came from a permission deny so they
+        # are excluded from num_turns (RR5).
+        self._turn_tool_uses: dict[str, dict[str, Any]] = {}
+        # tool_use_ids whose rejected tool_result came from a permission deny, so
+        # _has_tool_result excludes them from the num_turns count (RR5).
+        self._denied_tool_use_ids: set[str] = set()
+        # Set when can_use_tool denied a tool this turn: the interactive CLI then
+        # goes idle (no turn_duration record), so the tail loop synthesizes a
+        # terminating result once the rejected tool_result lands (RR1).
+        self._deny_terminated = False
         # Real session id discovered from transcript records (resume/fork can
         # make the CLI use an id different from the one we generated).
         self._observed_session_id: str | None = None
@@ -848,17 +871,21 @@ class PtyCLITransport(Transport):
         if option is None:
             return False
         await self._send_option_choice(option)
-        # Record a denial for the result's permission_denials, mirroring the
-        # stream-json field shape (tool + input target).
         if want == "deny":
-            self._turn_permission_denials.append(
-                {
-                    "tool_name": question.tool,
-                    "tool_input": {"target": question.target}
-                    if question.target
-                    else {},
-                }
-            )
+            # Defer building the permission_denials entry: the TUI dialog only
+            # exposes a target string, but the baseline shape carries the real
+            # ``tool_use_id`` and the FULL original tool input. Both are
+            # recoverable from the transcript -- the rejected ``tool_result``
+            # record carries ``tool_use_id`` and the preceding ``tool_use`` block
+            # carries the real ``input``/``id`` -- so we record the denied tool
+            # name here and correlate it to the transcript in _emit_line (RR2).
+            if question.tool:
+                self._pending_denied_tools.append(question.tool)
+            # A denied tool leaves the interactive CLI idle with no
+            # ``turn_duration`` record, so the turn would hang forever (RR1).
+            # Mark the turn as deny-terminated so _emit_line synthesizes a
+            # terminating result once the rejected tool_result lands.
+            self._deny_terminated = True
         return True
 
     async def _decide_permission(
@@ -1071,18 +1098,117 @@ class PtyCLITransport(Transport):
             if err or stop_reason == "refusal":
                 self._turn_is_error = True
                 self._turn_subtype = self._error_subtype(err, stop_reason)
+            # Record this turn's tool_use blocks (id -> name/input) so a later
+            # deny can recover the real tool_use_id + full input (RR2).
+            self._record_tool_uses(msg)
             if isinstance(msg_id, str) and msg_id:
                 if msg_id in self._seen_assistant_ids:
                     return  # already emitted this assistant message; drop snapshot
                 self._seen_assistant_ids.add(msg_id)
         elif entry_type == "user":
+            user_msg = message.get("message")
+            # Correlate any rejected tool_result with a pending deny so the
+            # result's permission_denials carries the baseline shape (RR2) and
+            # the denied tool_result is excluded from num_turns (RR5).
+            self._correlate_denials(user_msg)
             # num_turns counts API round-trips: each tool_result user record is
             # the model being called again with the tool output. Counted here;
-            # num_turns = tool_results + 1 (the final answer turn).
-            if _has_tool_result(message.get("message")):
+            # num_turns = tool_results + 1 (the final answer turn). A rejected
+            # tool_result from a permission deny is NOT a real round-trip back to
+            # the model, so it is excluded (RR5).
+            if self._counts_as_round_trip(user_msg):
                 self._turn_tool_results += 1
 
         await self._send(message)
+
+        # A denied tool leaves the interactive CLI idle (no turn_duration
+        # record), so synthesize a terminating result once the rejected
+        # tool_result has been processed (RR1). Done after _send so the
+        # tool_result message reaches consumers before the result.
+        if (
+            entry_type == "user"
+            and self._deny_terminated
+            and not self._result_emitted
+            and _has_tool_result(message.get("message"))
+        ):
+            await self._emit_deny_result(entry)
+
+    def _record_tool_uses(self, message: dict[str, Any]) -> None:
+        """Index this assistant message's tool_use blocks by id (RR2)."""
+        content = message.get("content")
+        if not isinstance(content, list):
+            return
+        for block in content:
+            if not isinstance(block, dict) or block.get("type") != "tool_use":
+                continue
+            tid = block.get("id")
+            if isinstance(tid, str) and tid:
+                self._turn_tool_uses[tid] = {
+                    "name": block.get("name"),
+                    "input": block.get("input"),
+                }
+
+    def _correlate_denials(self, message: Any) -> None:
+        """Build baseline-shaped permission_denials from rejected tool_results.
+
+        The TUI deny only exposed a target string; the baseline entry is
+        ``{tool_name, tool_use_id, tool_input(full)}`` (RR2). We match a rejected
+        ``tool_result`` (``is_error``) back to its ``tool_use`` block (by id) and,
+        if its tool name is in the pending-deny queue, emit the full entry and
+        record the id so it is excluded from num_turns (RR5).
+        """
+        if not isinstance(message, dict):
+            return
+        content = message.get("content")
+        if not isinstance(content, list):
+            return
+        for block in content:
+            if not isinstance(block, dict) or block.get("type") != "tool_result":
+                continue
+            if not block.get("is_error"):
+                continue
+            tuid = block.get("tool_use_id")
+            tool_use = self._turn_tool_uses.get(tuid) if isinstance(tuid, str) else None
+            tool_name = tool_use.get("name") if tool_use else None
+            # Only treat it as a permission denial if we denied this tool.
+            if tool_name in self._pending_denied_tools:
+                self._pending_denied_tools.remove(tool_name)
+            elif self._pending_denied_tools and tool_name is None:
+                # Fall back to FIFO order when the tool name is not recoverable.
+                tool_name = self._pending_denied_tools.pop(0)
+            else:
+                continue
+            tool_input = tool_use.get("input") if tool_use else None
+            entry: dict[str, Any] = {
+                "tool_name": tool_name,
+                "tool_use_id": tuid,
+                "tool_input": tool_input if isinstance(tool_input, dict) else {},
+            }
+            self._turn_permission_denials.append(entry)
+            if isinstance(tuid, str):
+                self._denied_tool_use_ids.add(tuid)
+
+    def _counts_as_round_trip(self, message: Any) -> bool:
+        """True if a user record is a real API round-trip for num_turns (RR5).
+
+        A normal tool_result counts (the model is called again with the output).
+        A tool_result rejected by a permission deny does NOT -- the model is not
+        re-invoked with it -- so it is excluded so num_turns matches the baseline
+        for a denied turn.
+        """
+        if not isinstance(message, dict):
+            return False
+        content = message.get("content")
+        if not isinstance(content, list):
+            return False
+        has_real = False
+        for block in content:
+            if not isinstance(block, dict) or block.get("type") != "tool_result":
+                continue
+            if block.get("tool_use_id") in self._denied_tool_use_ids:
+                continue
+            has_real = True
+        return has_real
 
     @staticmethod
     def _error_subtype(error: Any, stop_reason: str | None) -> str:
@@ -1103,6 +1229,10 @@ class PtyCLITransport(Transport):
 
     async def _emit_result(self, entry: dict[str, Any]) -> None:
         """Synthesize and emit a result from a ``turn_duration`` record."""
+        # A deny (RR1) or interrupt (R4) may have already emitted a terminating
+        # result for this turn; a stray turn_duration must not double-emit.
+        if self._result_emitted:
+            return
         self._turn_count += 1
         duration = entry.get("durationMs", 0)
         # num_turns = (tool_result records this turn) + 1. Each tool_result is
@@ -1169,6 +1299,10 @@ class PtyCLITransport(Transport):
         self._turn_tool_results = 0
         self._seen_assistant_ids = set()
         self._turn_permission_denials = []
+        self._pending_denied_tools = []
+        self._turn_tool_uses = {}
+        self._denied_tool_use_ids = set()
+        self._deny_terminated = False
         self._turn_start_time = None
 
     async def _emit_interrupt_result(self) -> None:
@@ -1212,6 +1346,63 @@ class PtyCLITransport(Transport):
             if model_usage is not None:
                 result["modelUsage"] = model_usage
         result["permission_denials"] = list(self._turn_permission_denials)
+        self._result_emitted = True
+        await self._send(result)
+        self._reset_turn_state()
+
+    async def _emit_deny_result(self, entry: dict[str, Any]) -> None:
+        """Synthesize a terminating result after a permission deny (RR1).
+
+        When ``can_use_tool`` denies a tool, the interactive CLI lands the deny
+        (writing a rejected ``tool_result``) and then goes IDLE awaiting further
+        user input -- it never writes a ``turn_duration`` record, so
+        ``_emit_result`` never fires and ``receive_response()`` would deadlock.
+        The stream-json baseline returned a terminating ``ResultMessage`` for a
+        denied turn (live-verified ``subtype=success``, ``is_error=False``,
+        carrying ``permission_denials``), so we mirror that here.
+
+        Guarded against double-emit: if a real ``turn_duration`` does arrive
+        later (e.g. the CLI resumes and finishes the turn), ``_result_emitted``
+        suppresses a second result.
+        """
+        if self._result_emitted:
+            return
+        self._turn_count += 1
+        duration = 0
+        if self._turn_start_time is not None:
+            duration = int((time.monotonic() - self._turn_start_time) * 1000)
+        # num_turns excludes the rejected (denied) tool_result -- it is not a
+        # real round-trip back to the model (RR5).
+        num_turns = self._turn_tool_results + 1
+        result: dict[str, Any] = {
+            "type": "result",
+            # Baseline denied turn was subtype=success / is_error=False.
+            "subtype": "success",
+            "duration_ms": duration,
+            "duration_api_ms": duration,
+            "is_error": False,
+            "num_turns": num_turns,
+            "session_id": self._observed_session_id
+            or entry.get("sessionId")
+            or self._session_id,
+            # The interactive CLI produced no final assistant text after the deny
+            # (it idles), so result text is whatever accumulated before, if any.
+            "result": self._turn_text or None,
+            "stop_reason": self._turn_stop_reason,
+            "uuid": str(uuid.uuid4()),
+        }
+        if self._turn_usage.has_data():
+            result["usage"] = self._turn_usage.aggregate_usage()
+            cost = self._turn_usage.total_cost()
+            if cost is not None:
+                result["total_cost_usd"] = cost
+            model_usage = self._turn_usage.model_usage()
+            if model_usage is not None:
+                result["modelUsage"] = model_usage
+        result["permission_denials"] = list(self._turn_permission_denials)
+        structured = self._extract_structured_output()
+        if structured is not None:
+            result["structured_output"] = structured
         self._result_emitted = True
         await self._send(result)
         self._reset_turn_state()
@@ -1459,8 +1650,33 @@ class PtyCLITransport(Transport):
         if text.strip():
             await self._type_prompt(text)
 
+    async def _emit_init_message(self) -> None:
+        """Emit a fresh ``system/init`` message (RR4).
+
+        The baseline emits a ``system/init`` at the START OF EVERY TURN; the PTY
+        previously emitted it once at connect. Re-emitting it at each turn start
+        matches the baseline's per-turn message ordering so a consumer that reads
+        session id / capabilities at each turn boundary sees it every turn. By
+        now ``_build_init_data`` can carry the observed model / real session id.
+        """
+        init = self._build_init_data()
+        init.update(
+            {
+                "type": "system",
+                "subtype": "init",
+                "uuid": str(uuid.uuid4()),
+            }
+        )
+        await self._send(init)
+
     async def _type_prompt(self, text: str) -> None:
         await self._warmup()
+        # The init message for the first turn was emitted at connect(); emit a
+        # fresh one for every subsequent turn to match the baseline ordering
+        # (system/init leads every turn) (RR4).
+        if self._submitted_turns > 0:
+            await self._emit_init_message()
+        self._submitted_turns += 1
         # Bracketed paste makes the TUI insert the text verbatim, preserving
         # newlines and most special characters, after which a single CR submits.
         # Exception: a leading "/", "!" or "#" still triggers the TUI's
