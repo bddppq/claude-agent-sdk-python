@@ -365,9 +365,17 @@ class PtyCLITransport(Transport):
         # a faithful ``duration_ms`` if the turn ends without a turn_duration
         # record (e.g. an interrupt). ``None`` when no turn is in flight.
         self._turn_start_time: float | None = None
-        # Dedup assistant messages by message.id: the transcript writes several
-        # streaming snapshots per assistant message (same id, distinct uuid), so
-        # uuid dedup alone would emit the same assistant message multiple times.
+        # Track message.ids whose message-level usage has already been counted.
+        # The interactive transcript writes each content block of one assistant
+        # message as a SEPARATE record sharing the same ``message.id`` (distinct
+        # uuids), and EACH record repeats the SAME message-level ``usage``. We
+        # emit every block-record as its own AssistantMessage (matching the
+        # stream-json baseline's per-block granularity -- live-verified: the
+        # baseline emits ``A[Thinking] | A[Text] | A[ToolUse] | U | A[Text]``,
+        # one AssistantMessage per block, NOT a merged message), but the repeated
+        # usage must be counted only ONCE per id (C2). This set records ids whose
+        # usage has been counted (the TurnUsageAccumulator dedups too; this is
+        # the belt-and-suspenders guard).
         self._seen_assistant_ids: set[str] = set()
 
     # ------------------------------------------------------------------ #
@@ -1076,36 +1084,10 @@ class PtyCLITransport(Transport):
             return
 
         if entry_type == "assistant":
-            msg = message["message"]
-            text = _extract_text(msg)
-            if text:
-                self._turn_text = text
-            model = msg.get("model")
-            if isinstance(model, str) and model and model != "unknown":
-                self._turn_model = model
-            stop_reason = msg.get("stop_reason")
-            if isinstance(stop_reason, str):
-                self._turn_stop_reason = stop_reason
-            # Dedup by message.id: the interactive transcript writes MULTIPLE
-            # snapshots of the same assistant message as it streams (same
-            # message.id, distinct top-level uuid), so the uuid dedup above does
-            # not collapse them. add() keeps only the final snapshot per id, and
-            # we suppress re-emitting an already-seen assistant id to consumers
-            # so the same message is not delivered several times.
-            msg_id = msg.get("id")
-            self._turn_usage.add(msg_id, model, msg.get("usage"))
-            err = msg.get("error")
-            if err or stop_reason == "refusal":
-                self._turn_is_error = True
-                self._turn_subtype = self._error_subtype(err, stop_reason)
-            # Record this turn's tool_use blocks (id -> name/input) so a later
-            # deny can recover the real tool_use_id + full input (RR2).
-            self._record_tool_uses(msg)
-            if isinstance(msg_id, str) and msg_id:
-                if msg_id in self._seen_assistant_ids:
-                    return  # already emitted this assistant message; drop snapshot
-                self._seen_assistant_ids.add(msg_id)
-        elif entry_type == "user":
+            await self._handle_assistant(message)
+            return
+
+        if entry_type == "user":
             user_msg = message.get("message")
             # Correlate any rejected tool_result with a pending deny so the
             # result's permission_denials carries the baseline shape (RR2) and
@@ -1132,6 +1114,56 @@ class PtyCLITransport(Transport):
             and _has_tool_result(message.get("message"))
         ):
             await self._emit_deny_result(entry)
+
+    async def _handle_assistant(self, message: dict[str, Any]) -> None:
+        """Emit one assistant block-record as its own AssistantMessage (RV1).
+
+        The interactive transcript writes EACH content block of a single
+        assistant message as a SEPARATE record sharing the same ``message.id``
+        (with distinct top-level uuids) -- e.g. ``[thinking]``, ``[text]``,
+        ``[tool_use]`` -- and same-id ``tool_use`` records are INTERLEAVED with
+        the ``user``/``tool_result`` records they trigger. The stream-json
+        baseline emits ONE ``AssistantMessage`` per such block-record (live A/B:
+        ``A[Thinking] | A[Text] | A[ToolUse] | U | A[Text]`` and, for 3 Write
+        calls, ``A[Text] | A[ToolUse] | U | A[ToolUse] | U | A[ToolUse] | U |
+        A[Text]``), NOT a merged message. So we emit every distinct block-record
+        directly; the per-uuid dedup in ``_emit_line`` prevents a compaction
+        re-read from double-emitting. The earlier emit-suppression by
+        ``message.id`` (which dropped every block after the first) was the RV1
+        bug; merging by ``message.id`` would also drop the interleaved later
+        ``tool_use`` blocks. Each record repeats the SAME message-level
+        ``usage``, so usage is counted only ONCE per id (C2).
+        """
+        msg = message["message"]
+        msg_id = msg.get("id")
+
+        # Turn bookkeeping (cost/usage/error/tool_use index).
+        text = _extract_text(msg)
+        if text:
+            self._turn_text = text
+        model = msg.get("model")
+        if isinstance(model, str) and model and model != "unknown":
+            self._turn_model = model
+        stop_reason = msg.get("stop_reason")
+        if isinstance(stop_reason, str):
+            self._turn_stop_reason = stop_reason
+        # Usage is deduped by message.id (the accumulator keeps the last snapshot
+        # per id); the repeated per-block usage is counted once (C2/RR1).
+        self._turn_usage.add(msg_id, model, msg.get("usage"))
+        err = msg.get("error")
+        if err or stop_reason == "refusal":
+            self._turn_is_error = True
+            self._turn_subtype = self._error_subtype(err, stop_reason)
+        # Record this turn's tool_use blocks (id -> name/input) so a later deny
+        # can recover the real tool_use_id + full input (RR2).
+        self._record_tool_uses(msg)
+        if isinstance(msg_id, str) and msg_id:
+            self._seen_assistant_ids.add(msg_id)
+
+        # Emit this block-record as its own AssistantMessage (per-block
+        # granularity, matching the baseline). uuid dedup (in _emit_line)
+        # already guards against re-read duplicates.
+        await self._send(message)
 
     def _record_tool_uses(self, message: dict[str, Any]) -> None:
         """Index this assistant message's tool_use blocks by id (RR2)."""

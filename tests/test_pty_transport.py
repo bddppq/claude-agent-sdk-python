@@ -1171,8 +1171,10 @@ class TestResultFidelity:
                                 },
                             },
                         },
-                        # Duplicate snapshot of the same message id -> must not
-                        # double-count cost/usage.
+                        # A SECOND block-record sharing the same message.id but
+                        # carrying a DIFFERENT block (the real transcript shape:
+                        # one block per record, same id, repeated usage). Its
+                        # repeated usage must NOT double-count cost/usage.
                         {
                             "type": "assistant",
                             "sessionId": "s",
@@ -1181,7 +1183,7 @@ class TestResultFidelity:
                                 "role": "assistant",
                                 "id": "msg_1",
                                 "model": "claude-opus-4-8",
-                                "content": [{"type": "text", "text": "done"}],
+                                "content": [{"type": "text", "text": "more"}],
                                 "stop_reason": "end_turn",
                                 "usage": {
                                     "input_tokens": 1_000_000,
@@ -1207,11 +1209,12 @@ class TestResultFidelity:
             return _drain(t)
 
         msgs = anyio.run(_test)
-        # Only ONE assistant message must be emitted despite the duplicate
-        # snapshot (same message.id, distinct uuid).
-        assert sum(1 for m in msgs if m["type"] == "assistant") == 1
+        # Each distinct block-record surfaces (per-block granularity, RV1): two
+        # same-id records carrying different blocks -> two assistant messages.
+        assert sum(1 for m in msgs if m["type"] == "assistant") == 2
         result = next(m for m in msgs if m["type"] == "result")
-        # cost computed from usage x opus pricing; dedup keeps it at 5.0 not 10.0
+        # Usage/cost is deduped by message.id (repeated per block-record), so the
+        # cost stays at 5.0 (NOT 10.0) despite two records sharing msg_1.
         assert result["total_cost_usd"] == 5.0
         assert result["usage"]["input_tokens"] == 1_000_000
         assert result["stop_reason"] == "end_turn"
@@ -1659,6 +1662,110 @@ class TestDedup:
 
         msgs = anyio.run(_test)
         assert sum(1 for m in msgs if m["type"] == "assistant") == 1
+
+    def test_multiblock_same_id_blocks_all_survive(self, tmp_path):
+        """RV1: the interactive transcript writes each content block of one
+        assistant message as a SEPARATE record sharing one message.id (distinct
+        uuids) -- [thinking], then [text], then [tool_use]. The baseline emits
+        ONE AssistantMessage per block-record (per-block granularity, live A/B
+        verified), so all three blocks must surface (the RV1 bug dropped every
+        block after the first); usage is counted once across the shared id.
+        """
+
+        async def _test():
+            t = make_transport()
+            path = tmp_path / "s.jsonl"
+
+            def rec(uid, block):
+                return {
+                    "type": "assistant",
+                    "sessionId": "s",
+                    "uuid": uid,
+                    "message": {
+                        "role": "assistant",
+                        "id": "msg_X",
+                        "model": "claude-opus-4-8",
+                        "content": [block],
+                        "stop_reason": "tool_use",
+                        "usage": {"input_tokens": 100, "output_tokens": 5},
+                    },
+                }
+
+            path.write_text(
+                "\n".join(
+                    json.dumps(line)
+                    for line in [
+                        rec(
+                            "u1",
+                            {
+                                "type": "thinking",
+                                "thinking": "let me plan",
+                                "signature": "sig",
+                            },
+                        ),
+                        rec("u2", {"type": "text", "text": "I'll write files"}),
+                        rec(
+                            "u3",
+                            {
+                                "type": "tool_use",
+                                "id": "toolu_1",
+                                "name": "Write",
+                                "input": {"file_path": "a.txt", "content": "1"},
+                            },
+                        ),
+                        # A user tool_result ends the assistant message -> flush.
+                        {
+                            "type": "user",
+                            "sessionId": "s",
+                            "uuid": "u4",
+                            "message": {
+                                "role": "user",
+                                "content": [
+                                    {
+                                        "type": "tool_result",
+                                        "tool_use_id": "toolu_1",
+                                        "content": "ok",
+                                    }
+                                ],
+                            },
+                        },
+                        {"type": "system", "subtype": "turn_duration"},
+                    ]
+                )
+                + "\n"
+            )
+            t._transcript_path = path
+            t._out_send, t._out_recv = anyio.create_memory_object_stream(100)
+            t._input_ended = True
+            with anyio.fail_after(5):
+                await t._tail_loop()
+            return _drain(t)
+
+        msgs = anyio.run(_test)
+        # One AssistantMessage per block-record (baseline per-block granularity):
+        # the thinking, text, and tool_use blocks each surface (the RV1 bug
+        # surfaced only the first). Collect their block types in order.
+        assistants = [m for m in msgs if m["type"] == "assistant"]
+        block_types = [b["type"] for m in assistants for b in m["message"]["content"]]
+        assert block_types == ["thinking", "text", "tool_use"]
+        assert "tool_use" in block_types  # the headline RV1 regression
+        # The tool_use block carries the real id + full input.
+        tool_use = next(
+            b
+            for m in assistants
+            for b in m["message"]["content"]
+            if b["type"] == "tool_use"
+        )
+        assert tool_use["id"] == "toolu_1"
+        assert tool_use["input"] == {"file_path": "a.txt", "content": "1"}
+        # Ordering: the tool_use assistant record comes BEFORE the user
+        # tool_result, matching the baseline stream.
+        order = [m["type"] for m in msgs if m["type"] in ("assistant", "user")]
+        assert order == ["assistant", "assistant", "assistant", "user"]
+        # Usage counted once (single message.id), not x3.
+        result = next(m for m in msgs if m["type"] == "result")
+        assert result["usage"]["input_tokens"] == 100
+        assert result["usage"]["output_tokens"] == 5
 
 
 # --------------------------------------------------------------------------- #
