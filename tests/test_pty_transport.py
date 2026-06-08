@@ -718,7 +718,7 @@ class TestControlMappings:
 
     @pytest.mark.parametrize(
         "subtype",
-        ["get_context_usage", "rewind_files", "stop_task", "mcp_toggle"],
+        ["rewind_files", "stop_task", "mcp_toggle"],
     )
     def test_unsupported_controls_return_error(self, subtype):
         async def _test():
@@ -744,9 +744,10 @@ class TestControlMappings:
 
         This is the initialize CONTROL-RESPONSE shape (commands /
         available_output_styles / models / account / pid / agents /
-        output_style), NOT the system/init MESSAGE shape (tools / model /
-        permissionMode). get_server_info() consumers do info.get('commands', [])
-        etc., so every baseline key must be present.
+        output_style), plus the RL10 traffic-derived tools / model. The pure
+        system/init-only key ``permissionMode`` still does not leak in.
+        get_server_info() consumers do info.get('commands', []) etc., so every
+        baseline key must be present.
         """
 
         async def _test():
@@ -783,8 +784,13 @@ class TestControlMappings:
             assert isinstance(info["models"], list)
             assert isinstance(info["account"], dict)
             assert info["output_style"] == "default"
-            # The system/init MESSAGE shape keys must NOT leak into server info.
-            assert "tools" not in info
+            # RL10: the real resolved tool catalog + model ARE surfaced on
+            # get_server_info (populated from the relay-teed request when seen;
+            # an empty list before the first request, never fabricated).
+            assert "tools" in info and isinstance(info["tools"], list)
+            assert "model" in info
+            # A pure system/init MESSAGE key with no server-info equivalent must
+            # still NOT leak into the initialize control-response shape.
             assert "permissionMode" not in info
 
         anyio.run(_test)
@@ -2572,3 +2578,204 @@ class TestRecoverToolInputRV2:
         assert seen["input"] == {"command": "ls -la /etc"}
         assert seen["tool_use_id"] == "toolu_99"
         assert seen["name"] == "Bash"
+
+
+# --------------------------------------------------------------------------- #
+# RL9 / RL10 / RL11: traffic-derived enrichments from the API monitor
+# --------------------------------------------------------------------------- #
+
+
+def _api_record(**kwargs: object) -> dict:
+    """Build a minimal /v1/messages call record as the monitor tees it."""
+    record: dict = {
+        "path": "/v1/messages",
+        "method": "POST",
+        "status": 200,
+        "duration_ms": 10,
+        "model": None,
+        "request": None,
+        "usage": None,
+        "stop_reason": None,
+        "content_blocks": [],
+        "partial_text": "",
+        "sse_events": [],
+    }
+    record.update(kwargs)
+    return record
+
+
+class TestStreamEventsRL9:
+    """RL9: stream_event messages reconstructed from SSE, gated on the option."""
+
+    def test_emits_stream_events_when_option_set(self):
+        async def _test():
+            t = make_transport(include_partial_messages=True)
+            t._out_send, t._out_recv = anyio.create_memory_object_stream(50)
+            t._observed_session_id = "sess-1"
+            events = [
+                {"type": "message_start", "message": {"id": "msg_1"}},
+                {
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "text_delta", "text": "PONG"},
+                },
+                {"type": "message_stop"},
+            ]
+            t._on_api_call(_api_record(sse_events=events))
+            return [t._out_recv.receive_nowait() for _ in range(3)]
+
+        msgs = anyio.run(_test)
+        assert all(m["type"] == "stream_event" for m in msgs)
+        # Same shape as the stream-json baseline StreamEvent.
+        assert [m["event"]["type"] for m in msgs] == [
+            "message_start",
+            "content_block_delta",
+            "message_stop",
+        ]
+        for m in msgs:
+            assert m["session_id"] == "sess-1"
+            assert m["parent_tool_use_id"] is None
+            assert isinstance(m["uuid"], str) and m["uuid"]
+
+    def test_emits_nothing_when_option_unset(self):
+        async def _test():
+            t = make_transport()  # include_partial_messages defaults to False
+            t._out_send, t._out_recv = anyio.create_memory_object_stream(50)
+            events = [{"type": "message_start", "message": {"id": "x"}}]
+            t._on_api_call(_api_record(sse_events=events))
+            with pytest.raises(anyio.WouldBlock):
+                t._out_recv.receive_nowait()
+
+        anyio.run(_test)
+
+    def test_no_events_for_non_streaming_response(self):
+        async def _test():
+            t = make_transport(include_partial_messages=True)
+            t._out_send, t._out_recv = anyio.create_memory_object_stream(50)
+            t._on_api_call(_api_record(sse_events=[]))
+            with pytest.raises(anyio.WouldBlock):
+                t._out_recv.receive_nowait()
+
+        anyio.run(_test)
+
+
+class TestToolCatalogRL10:
+    """RL10: init / get_server_info tools+model from the request catalog."""
+
+    def test_init_uses_observed_tools_and_model(self):
+        t = make_transport(allowed_tools=["OnlyOption"])
+        t._on_api_call(
+            _api_record(
+                request={
+                    "model": "claude-opus-4-8",
+                    "tools": [
+                        {"name": "Read"},
+                        {"name": "Write"},
+                        {"name": "Bash"},
+                    ],
+                }
+            )
+        )
+        init = t._build_init_data()
+        assert init["tools"] == ["Read", "Write", "Bash"]
+        assert init["model"] == "claude-opus-4-8"
+
+    def test_init_falls_back_to_options_before_first_request(self):
+        t = make_transport(allowed_tools=["Read"], model="claude-sonnet-4-6")
+        init = t._build_init_data()
+        assert init["tools"] == ["Read"]
+        assert init["model"] == "claude-sonnet-4-6"
+
+    def test_server_info_carries_observed_tools_and_model(self):
+        t = make_transport()
+        t._on_api_call(
+            _api_record(
+                request={
+                    "model": "claude-opus-4-8",
+                    "tools": [{"name": "Read"}, {"name": "Edit"}],
+                }
+            )
+        )
+        info = t._build_server_info()
+        assert info["tools"] == ["Read", "Edit"]
+        assert info["model"] == "claude-opus-4-8"
+        assert info["models"] == ["claude-opus-4-8"]
+
+    def test_catalog_dedups_and_ignores_unnamed_tools(self):
+        t = make_transport()
+        t._on_api_call(
+            _api_record(
+                request={
+                    "tools": [
+                        {"name": "Read"},
+                        {"name": "Read"},  # dup
+                        {"type": "no_name"},  # ignored
+                        {"name": "Write"},
+                    ]
+                }
+            )
+        )
+        assert t._observed_tools == ["Read", "Write"]
+
+
+class TestContextUsageRL11:
+    """RL11: get_context_usage derived from the latest per-call token counts."""
+
+    def test_payload_from_latest_usage(self):
+        t = make_transport()
+        t._on_api_call(
+            _api_record(
+                model="claude-opus-4-8",
+                usage={
+                    "input_tokens": 100,
+                    "cache_read_input_tokens": 1000,
+                    "cache_creation_input_tokens": 50,
+                    "output_tokens": 5,
+                },
+            )
+        )
+        payload = t._context_usage_payload()
+        # totalTokens is the input side (uncached + cache read + cache write).
+        assert payload["totalTokens"] == 1150
+        assert payload["model"] == "claude-opus-4-8"
+        assert payload["rawMaxTokens"] == 1_000_000
+        assert payload["maxTokens"] == 1_000_000
+        assert payload["percentage"] == pytest.approx(0.115)
+        # Unobservable breakdowns are empty, not fabricated.
+        assert payload["categories"] == []
+        assert payload["mcpTools"] == []
+
+    def test_error_response_does_not_blank_context(self):
+        t = make_transport()
+        t._on_api_call(
+            _api_record(model="claude-opus-4-8", usage={"input_tokens": 200})
+        )
+        # A later non-2xx call must not overwrite the live figure.
+        t._on_api_call(_api_record(status=429, usage={"input_tokens": 1}))
+        payload = t._context_usage_payload()
+        assert payload["totalTokens"] == 200
+
+    def test_control_request_returns_context_usage(self):
+        async def _test():
+            t = make_transport()
+            t._ready = True
+            t._out_send, t._out_recv = anyio.create_memory_object_stream(10)
+            t._on_api_call(
+                _api_record(model="claude-opus-4-8", usage={"input_tokens": 42})
+            )
+            await t.write(
+                json.dumps(
+                    {
+                        "type": "control_request",
+                        "request_id": "ctx-1",
+                        "request": {"subtype": "get_context_usage"},
+                    }
+                )
+                + "\n"
+            )
+            return t._out_recv.receive_nowait()
+
+        msg = anyio.run(_test)
+        assert msg["type"] == "control_response"
+        assert msg["response"]["subtype"] == "success"
+        assert msg["response"]["response"]["totalTokens"] == 42

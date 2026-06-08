@@ -68,7 +68,7 @@ from .._task_compat import TaskHandle, spawn_detached
 from ..sessions import _canonicalize_path, _get_projects_dir, _sanitize_path
 from . import Transport, _cli_command
 from ._api_monitor import ApiMonitor
-from ._usage import TurnUsageAccumulator
+from ._usage import TurnUsageAccumulator, _limits_for
 from .pty_question import (
     SCREEN_COLS,
     SCREEN_ROWS,
@@ -408,6 +408,23 @@ class PtyCLITransport(Transport):
         # while a permission dialog blocks the TUI exposes only the tool name,
         # not its id, but the tool_use is already in the intercepted response).
         self._turn_tool_input_by_name: dict[str, dict[str, Any]] = {}
+        # Tool catalog (ordered tool NAMES) the CLI actually sent on a
+        # /v1/messages request, captured from the request body the relay tees
+        # (RL10). Unlike the thin options-derived defaults, this is the CLI's
+        # real resolved tool list (built-ins + MCP + the options' allowed set),
+        # so init/get_server_info report what the model was actually offered.
+        # Persists across turns (the catalog is session-stable); the latest
+        # request wins. ``None`` until the first /v1/messages request is seen.
+        self._observed_tools: list[str] | None = None
+        # Model id the CLI actually sent on a /v1/messages request (RL10): the
+        # resolved main model, used to populate init/get_server_info ``model``.
+        self._observed_request_model: str | None = None
+        # Latest per-call usage seen on a successful /v1/messages response, used
+        # by get_context_usage to report the live context size (RL11). The main
+        # model's ``input_tokens`` (+ cache fields) of the most recent real call
+        # approximate the current context window occupancy.
+        self._latest_context_usage: dict[str, Any] | None = None
+        self._latest_context_model: str | None = None
 
     # ------------------------------------------------------------------ #
     # Connection lifecycle
@@ -541,10 +558,17 @@ class PtyCLITransport(Transport):
         keys instead of a 5-field stub.
         """
         o = self._options
-        tools: list[str] = []
-        if isinstance(o.tools, list):
-            tools = list(o.tools)
-        tools.extend(t for t in o.allowed_tools if t not in tools)
+        # RL10: prefer the CLI's real resolved tool catalog observed on a teed
+        # /v1/messages request (built-ins + MCP + the options' allowed set) over
+        # the thin options-derived list. Falls back to the options when no
+        # request has been seen yet (e.g. before the first turn).
+        if self._observed_tools:
+            tools: list[str] = list(self._observed_tools)
+        else:
+            tools = []
+            if isinstance(o.tools, list):
+                tools = list(o.tools)
+            tools.extend(t for t in o.allowed_tools if t not in tools)
 
         mcp_servers: list[dict[str, Any]] = []
         if isinstance(o.mcp_servers, dict):
@@ -563,7 +587,9 @@ class PtyCLITransport(Transport):
         # back to the caller's requested model. The init message is emitted at
         # connect before any transcript record, so on the first connect this is
         # ``options.model``; later reconstructions pick up the observed model.
-        model = self._turn_model or o.model or ""
+        # RL10: the model the CLI actually sent on a /v1/messages request is the
+        # most authoritative resolved id; prefer it when available.
+        model = self._observed_request_model or self._turn_model or o.model or ""
 
         return {
             "session_id": self._observed_session_id or self._session_id,
@@ -607,11 +633,27 @@ class PtyCLITransport(Transport):
         if isinstance(self._options.agents, dict):
             agents = [{"name": name} for name in self._options.agents]
 
+        # RL10: surface the CLI's real resolved tool catalog + model observed on
+        # a teed /v1/messages request. The slash-command/model catalogs and
+        # account identity are only available over the deleted stream-json
+        # ``initialize`` channel, so those stay empty rather than fabricated; the
+        # tool list and model, however, ARE recoverable from the traffic and are
+        # exactly what the model was offered.
+        tools: list[str] = list(self._observed_tools) if self._observed_tools else []
+        model = (
+            self._observed_request_model
+            or self._turn_model
+            or (self._options.model or "")
+        )
+        models = [model] if model else []
+
         return {
             "commands": [],
             "available_output_styles": ["default"],
             "output_style": "default",
-            "models": [],
+            "models": models,
+            "model": model,
+            "tools": tools,
             "account": {},
             "agents": agents,
             "pid": self._proc.pid if self._proc is not None else None,
@@ -745,8 +787,96 @@ class PtyCLITransport(Transport):
                     self._turn_tool_inputs[tid] = entry
                 if isinstance(name, str) and name:
                     self._turn_tool_input_by_name[name] = entry
+            # RL10: capture the CLI's real resolved tool catalog + model from the
+            # request body the relay teed, so init/get_server_info report what the
+            # model was actually offered (not the thin options-derived defaults).
+            self._capture_tool_catalog(record.get("request"))
+            # RL11: remember the latest successful per-call usage as the live
+            # context-size signal for get_context_usage.
+            self._capture_context_usage(record)
+            # RL9: when include_partial_messages is set, reconstruct and emit
+            # stream_event messages from the SSE events the relay already saw.
+            if self._options.include_partial_messages:
+                self._emit_stream_events(record.get("sse_events"))
         except Exception:
             logger.debug("API monitor record handling failed", exc_info=True)
+
+    def _capture_tool_catalog(self, request: Any) -> None:
+        """Record the tool names + model from a teed /v1/messages request (RL10).
+
+        The CLI's request body carries the actual resolved ``tools`` list it
+        offered the model (built-ins + MCP + the options' allowed set) and the
+        resolved ``model`` id -- neither of which the transcript exposes. The
+        catalog is session-stable, so the latest request wins and the value
+        persists across turns.
+        """
+        if not isinstance(request, dict):
+            return
+        raw_tools = request.get("tools")
+        if isinstance(raw_tools, list):
+            names: list[str] = []
+            for tool in raw_tools:
+                if isinstance(tool, dict):
+                    name = tool.get("name")
+                    if isinstance(name, str) and name and name not in names:
+                        names.append(name)
+            if names:
+                self._observed_tools = names
+        model = request.get("model")
+        if isinstance(model, str) and model:
+            self._observed_request_model = model
+
+    def _capture_context_usage(self, record: dict[str, Any]) -> None:
+        """Track the latest real per-call usage for get_context_usage (RL11).
+
+        The most recent successful /v1/messages call's ``usage`` (input +
+        cache_read + cache_creation tokens) approximates the current context
+        window occupancy. Skip non-2xx / usage-less calls so an error response
+        doesn't blank the live figure.
+        """
+        status = record.get("status")
+        if not (isinstance(status, int) and 200 <= status < 300):
+            return
+        usage = record.get("usage")
+        if not isinstance(usage, dict) or not usage:
+            return
+        self._latest_context_usage = usage
+        model = record.get("model") or self._observed_request_model
+        if isinstance(model, str) and model:
+            self._latest_context_model = model
+
+    def _emit_stream_events(self, sse_events: Any) -> None:
+        """Emit one ``stream_event`` message per raw SSE event (RL9).
+
+        Reconstructs the stream-json baseline's ``StreamEvent`` shape
+        (``{type:"stream_event", uuid, session_id, event, parent_tool_use_id}``)
+        from the Anthropic SSE events the relay teed. Runs on the monitor's serve
+        task (same event loop), so it uses the non-blocking ``send_nowait`` to
+        hand the messages to the output stream; a full buffer just drops the
+        partial event (best-effort, never blocks the relay/turn). Emits nothing
+        when the response was not streaming (empty ``sse_events``).
+        """
+        if not isinstance(sse_events, list) or not sse_events:
+            return
+        if self._out_send is None:
+            return
+        session_id = self._observed_session_id or self._session_id
+        for event in sse_events:
+            if not isinstance(event, dict) or not event.get("type"):
+                continue
+            message = {
+                "type": "stream_event",
+                "uuid": str(uuid.uuid4()),
+                "session_id": session_id,
+                "event": event,
+                "parent_tool_use_id": None,
+            }
+            with contextlib.suppress(
+                anyio.WouldBlock,
+                anyio.BrokenResourceError,
+                anyio.ClosedResourceError,
+            ):
+                self._out_send.send_nowait(message)
 
     def _ensure_onboarding_complete(self) -> None:
         """Clear interactive gates that would block programmatic input.
@@ -1832,6 +1962,7 @@ class PtyCLITransport(Transport):
             "set_permission_mode",
             "set_model",
             "mcp_status",
+            "get_context_usage",
         }
     )
 
@@ -1869,6 +2000,8 @@ class PtyCLITransport(Transport):
                 error = await self._set_model(request.get("model"))
             elif subtype == "mcp_status":
                 payload = self._mcp_status_payload()
+            elif subtype == "get_context_usage":
+                payload = self._context_usage_payload()
             elif subtype not in self._SUPPORTED_CONTROLS:
                 error = (
                     f"control request '{subtype}' is not supported by the "
@@ -1900,6 +2033,55 @@ class PtyCLITransport(Transport):
                     },
                 }
             )
+
+    def _context_usage_payload(self) -> dict[str, Any]:
+        """Build a get_context_usage payload from observed traffic (RL11).
+
+        The interactive transcript has no ``/context`` data, but the relay tees
+        the real per-call ``usage`` of every /v1/messages call. The latest
+        successful call's input side (uncached ``input_tokens`` + cache reads +
+        cache writes) is the model's current context-window occupancy, so we
+        report it as ``totalTokens`` and derive ``percentage`` against the
+        model's context window.
+
+        Only observable fields are populated. The category breakdown, memory
+        files, MCP tool token costs, etc. are NOT recoverable from the wire, so
+        they are returned empty rather than fabricated -- a faithful, drop-in
+        shape (every ``ContextUsageResponse`` key present with a real or empty
+        value) that does not invent numbers.
+        """
+        usage = self._latest_context_usage
+        model = (
+            self._latest_context_model
+            or self._observed_request_model
+            or (self._turn_model or self._options.model or "")
+        )
+        total = 0
+        if isinstance(usage, dict):
+            for key in (
+                "input_tokens",
+                "cache_read_input_tokens",
+                "cache_creation_input_tokens",
+            ):
+                value = usage.get(key)
+                if isinstance(value, int):
+                    total += value
+        limits = _limits_for(model)
+        raw_max = limits["contextWindow"] if limits else 0
+        percentage = (total / raw_max * 100.0) if raw_max else 0.0
+        return {
+            "categories": [],
+            "totalTokens": total,
+            "maxTokens": raw_max,
+            "rawMaxTokens": raw_max,
+            "percentage": percentage,
+            "model": model,
+            "isAutoCompactEnabled": False,
+            "memoryFiles": [],
+            "mcpTools": [],
+            "agents": [],
+            "gridRows": [],
+        }
 
     def _mcp_status_payload(self) -> dict[str, Any]:
         """Best-effort MCP status from the configured servers (C4).

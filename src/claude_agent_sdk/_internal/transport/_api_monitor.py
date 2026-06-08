@@ -665,6 +665,11 @@ class ApiMonitor:
         usage, stop_reason, content_blocks, partial_text, model = _parse_response_body(
             resp_headers, decoded_resp
         )
+        # The raw Anthropic SSE events (message_start / content_block_delta /
+        # message_delta / ...) in order. Used to reconstruct ``stream_event``
+        # (partial) messages when ``include_partial_messages`` is set (RL9). Empty
+        # for a non-streaming (plain JSON) response.
+        sse_events = _extract_sse_events(resp_headers, decoded_resp)
         # Fall back to the request's model when the response did not carry one
         # (e.g. an error response): the per-call cost is keyed on the model.
         if model is None and isinstance(request_json, dict):
@@ -683,6 +688,7 @@ class ApiMonitor:
             "stop_reason": stop_reason,
             "content_blocks": content_blocks,
             "partial_text": partial_text,
+            "sse_events": sse_events,
         }
         self._callback(record)
 
@@ -763,6 +769,43 @@ def _parse_response_body(
     raw_model = obj.get("model")
     model: str | None = raw_model if isinstance(raw_model, str) else None
     return usage, stop_reason, blocks, partial, model
+
+
+def _extract_sse_events(headers: dict[str, str], body: bytes) -> list[dict[str, Any]]:
+    """Return the raw Anthropic SSE event objects, in order (RL9).
+
+    Each ``data:`` line of a ``text/event-stream`` /v1/messages response is one
+    JSON event (``message_start``, ``content_block_start``,
+    ``content_block_delta``, ``content_block_stop``, ``message_delta``,
+    ``message_stop``). These are the exact objects the stream-json baseline
+    surfaced as ``StreamEvent.event`` when ``include_partial_messages`` was set,
+    so the PTY transport can reconstruct the same partial messages from the
+    traffic it already tees. Returns ``[]`` for a non-streaming (plain JSON)
+    response so the caller emits nothing in that case.
+    """
+    if not body:
+        return []
+    content_type = headers.get("content-type", "").lower()
+    text = body.decode("utf-8", "replace")
+    if "text/event-stream" not in content_type and not text.lstrip().startswith(
+        "event:"
+    ):
+        return []
+    events: list[dict[str, Any]] = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line.startswith("data:"):
+            continue
+        payload = line[len("data:") :].strip()
+        if not payload or payload == "[DONE]":
+            continue
+        try:
+            event = json.loads(payload)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if isinstance(event, dict) and event.get("type"):
+            events.append(event)
+    return events
 
 
 def _parse_sse(
