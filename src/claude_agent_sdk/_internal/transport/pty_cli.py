@@ -701,11 +701,9 @@ class PtyCLITransport(Transport):
             )
 
         # Accepted-but-inert observability flags: warn rather than fail.
-        if o.include_partial_messages:
-            logger.warning(
-                "include_partial_messages has no effect with the interactive "
-                "transport; no partial/stream_event records exist in the transcript."
-            )
+        # NOTE: include_partial_messages IS honored (RL9): the relay tees the
+        # /v1/messages SSE stream and reconstructs stream_event/StreamEvent records,
+        # so no warning is emitted for it.
         if o.include_hook_events:
             logger.warning(
                 "include_hook_events is passed to the CLI but yields no "
@@ -855,6 +853,17 @@ class PtyCLITransport(Transport):
         hand the messages to the output stream; a full buffer just drops the
         partial event (best-effort, never blocks the relay/turn). Emits nothing
         when the response was not streaming (empty ``sse_events``).
+
+        N5 (necessary residual): unlike the stream-json baseline, which
+        backpressures partial delivery through the consumer-paced stream, this
+        cannot block. It runs on the monitor's serve task; blocking here would
+        stall relay forwarding -- a transparency violation that would affect the
+        actual upstream turn, which is strictly worse than dropping an
+        observability-only partial. The drop only affects partial/stream_event
+        messages (never result correctness), and the output buffer is already
+        generous (default 1000 dicts) and user-tunable via
+        ``ClaudeAgentOptions.max_buffer_size`` for slow consumers on long,
+        ping-heavy turns. So the non-blocking drop is retained deliberately.
         """
         if not isinstance(sse_events, list) or not sse_events:
             return

@@ -1121,10 +1121,18 @@ class TestValidateOptions:
         anyio.run(_test)
 
     def test_observability_flags_warn_not_raise(self, caplog):
-        t = make_transport(include_partial_messages=True, include_hook_events=True)
+        t = make_transport(include_hook_events=True)
         with caplog.at_level("WARNING"):
             t._validate_options()  # must not raise
-        assert any("include_partial_messages" in r.message for r in caplog.records)
+        assert any("include_hook_events" in r.message for r in caplog.records)
+
+    def test_include_partial_messages_does_not_warn(self, caplog):
+        # RL9-warn: include_partial_messages IS honored (StreamEvents emitted from
+        # the relay-teed SSE stream), so the stale "no effect" warning is gone.
+        t = make_transport(include_partial_messages=True)
+        with caplog.at_level("WARNING"):
+            t._validate_options()  # must not raise
+        assert not any("include_partial_messages" in r.message for r in caplog.records)
 
 
 # --------------------------------------------------------------------------- #

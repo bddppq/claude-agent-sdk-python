@@ -1066,6 +1066,50 @@ class TestClaudeSDKClientEdgeCases:
                 pass
 
     @pytest.mark.anyio
+    async def test_get_server_info_not_connected(self):
+        """get_server_info() raises when not connected."""
+        client = ClaudeSDKClient()
+        with pytest.raises(CLIConnectionError, match="Not connected"):
+            await client.get_server_info()
+
+    @pytest.mark.anyio
+    async def test_get_server_info_reissues_initialize(self):
+        """RL10: get_server_info() re-issues initialize and returns the FRESH result.
+
+        The connect-time snapshot has tools=[] (PTY: pre-traffic), but re-issuing
+        the initialize control request after a turn returns the live catalog. The
+        accessor must reflect the fresh response, not the stale cached one.
+        """
+        client = ClaudeSDKClient()
+        fresh = {"tools": ["Read", "Write", "Edit"], "model": "claude-opus-4-8"}
+        mock_query = Mock()
+        mock_query.initialize = AsyncMock(return_value=fresh)
+        mock_query._initialization_result = {"tools": [], "model": ""}  # stale
+        client._query = mock_query
+
+        result = await client.get_server_info()
+
+        mock_query.initialize.assert_awaited_once()
+        assert result == fresh
+        assert result["tools"] == ["Read", "Write", "Edit"]
+        assert result["model"] == "claude-opus-4-8"
+
+    @pytest.mark.anyio
+    async def test_get_server_info_falls_back_to_cache_on_error(self):
+        """If re-issuing initialize fails, fall back to the cached snapshot."""
+        client = ClaudeSDKClient()
+        cached = {"tools": ["Read"], "model": "claude-opus-4-8"}
+        mock_query = Mock()
+        mock_query.initialize = AsyncMock(side_effect=RuntimeError("transport down"))
+        mock_query._initialization_result = cached
+        client._query = mock_query
+
+        result = await client.get_server_info()
+
+        mock_query.initialize.assert_awaited_once()
+        assert result == cached
+
+    @pytest.mark.anyio
     async def test_double_connect(self):
         """Test connecting twice."""
 
