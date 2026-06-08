@@ -62,6 +62,7 @@ from ..._errors import CLIConnectionError, CLINotFoundError
 from ...types import (
     ClaudeAgentOptions,
     PermissionResultAllow,
+    PermissionUpdate,
     ToolPermissionContext,
 )
 from .._task_compat import TaskHandle, spawn_detached
@@ -1188,8 +1189,8 @@ class PtyCLITransport(Transport):
 
     async def _decide_permission(
         self, question: DetectedQuestion
-    ) -> Literal["allow", "deny"]:
-        """Return "allow" or "deny" for a permission/plan dialog.
+    ) -> Literal["allow", "allow_persist", "deny"]:
+        """Return the decision for a permission/plan dialog.
 
         Routes through ``can_use_tool`` when configured (C5); otherwise uses a
         safe default keyed to the permission mode (C6): permissive modes allow so
@@ -1197,6 +1198,13 @@ class PtyCLITransport(Transport):
         appears for actions the CLI would otherwise gate, and hanging is worse
         for a drop-in consumer than completing). Callers wanting denial should
         provide ``can_use_tool``.
+
+        RL12: when the callback's ``PermissionResultAllow`` carries a
+        session-broad ``updated_permissions`` (see
+        :meth:`_should_persist_allow`), return ``"allow_persist"`` so the
+        watcher presses the TUI's "allow all edits during this session" option
+        and the grant survives for the rest of the session. Narrow rules that
+        the coarse TUI option would over-grant fall back to plain ``"allow"``.
         """
         callback = self._options.can_use_tool
         if callback is not None and question.tool:
@@ -1234,11 +1242,79 @@ class PtyCLITransport(Transport):
                 return "deny"
             # Defensive: treat anything that is not an explicit Allow as deny
             # (covers a callback that returns a malformed value at runtime).
-            return "allow" if isinstance(result, PermissionResultAllow) else "deny"
+            if not isinstance(result, PermissionResultAllow):
+                return "deny"
+            # RL12: a non-empty, session-broad updated_permissions maps onto the
+            # TUI's session-allow option; otherwise apply this call only.
+            if self._should_persist_allow(question, result.updated_permissions):
+                return "allow_persist"
+            return "allow"
         # No callback: allow so the turn completes (C6). The prompt only appears
         # in modes that gate; consumers that need gating should pass can_use_tool
         # or use disallowed_tools / a restrictive permission mode.
         return "allow"
+
+    @staticmethod
+    def _should_persist_allow(
+        question: DetectedQuestion,
+        updated_permissions: list[PermissionUpdate] | None,
+    ) -> bool:
+        """Decide whether to press the TUI session-allow option (RL12).
+
+        The interactive CLI only exposes a COARSE "allow all edits during this
+        session" affordance: it persists by tool-category for the session, not
+        an arbitrary :class:`PermissionUpdate` rule. Pressing it to satisfy a
+        narrow rule (e.g. "allow Write to /tmp" only) would OVER-GRANT. So we
+        require BOTH:
+
+        1. A persist option actually exists in the rendered dialog (otherwise
+           there is nothing to press -- e.g. Bash shows "always allow access to
+           tmp/" which is a different, path-scoped action; we degrade to
+           allow_once via :func:`choose_option`).
+        2. The requested update is genuinely SESSION-BROAD, i.e. it would not be
+           surprising for the user to see "all edits this session" granted:
+             - any ``setMode`` update (changes the session permission mode --
+               inherently session-wide and broad), OR
+             - an ``addRules``/``replaceRules`` *allow* update scoped to the
+               ``"session"`` destination whose rules are tool-category-broad
+               (no narrowing ``rule_content``).
+
+        A narrow rule (``rule_content`` set), a non-session destination
+        (userSettings/projectSettings/localSettings -- the TUI session option
+        cannot express persistence to disk), a deny/ask behavior, or an empty
+        list all fail the test, so we fall back to one-shot allow rather than
+        silently granting broader-than-requested. The exact persisted rule then
+        simply cannot be expressed via the TUI; we apply this call faithfully.
+        """
+        if not updated_permissions:
+            return False
+        has_persist_option = any(o.action == "allow_persist" for o in question.options)
+        if not has_persist_option:
+            return False
+        for upd in updated_permissions:
+            # setMode is inherently a session-wide, broad change of posture.
+            if upd.type == "setMode":
+                return True
+            if upd.type in ("addRules", "replaceRules"):
+                # Only an *allow* rule maps onto an allow-persist press. deny/ask
+                # cannot be expressed by pressing "allow all".
+                if upd.behavior is not None and upd.behavior != "allow":
+                    continue
+                # Must be scoped to the session (the only thing the TUI's
+                # session-allow option can honor); disk-scoped destinations
+                # would over-claim what the keystroke actually does.
+                if upd.destination not in (None, "session"):
+                    continue
+                # Tool-category broad: a narrowing rule_content (e.g. a path
+                # glob) is finer than the TUI's "all edits this session", so
+                # pressing persist would over-grant -- skip it.
+                rules = upd.rules or []
+                if any(r.rule_content for r in rules):
+                    continue
+                return True
+            # addDirectories/removeDirectories/removeRules don't correspond to
+            # the "allow all edits this session" press; ignore them.
+        return False
 
     async def _await_recovered_tool_input(
         self, tool_name: str, timeout_s: float = 2.0, poll_s: float = 0.02

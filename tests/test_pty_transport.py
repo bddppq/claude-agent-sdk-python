@@ -1041,6 +1041,238 @@ class TestPermissionAnswering:
         ) != PtyCLITransport._question_fingerprint(q3)
 
 
+class TestPersistAllowRL12:
+    """RL12: map can_use_tool updated_permissions -> the TUI session-allow option."""
+
+    @staticmethod
+    def _question(*, persist_opt=True):
+        from claude_agent_sdk._internal.transport.pty_question import (
+            DetectedQuestion,
+            QuestionOption,
+        )
+
+        opts = [QuestionOption(index=1, label="Yes", action="allow_once")]
+        if persist_opt:
+            opts.append(
+                QuestionOption(
+                    index=2,
+                    label="Yes, allow all edits during this session",
+                    action="allow_persist",
+                )
+            )
+        opts.append(QuestionOption(index=3, label="No", action="deny"))
+        return DetectedQuestion(
+            kind="permission",
+            question="Allow Write?",
+            options=opts,
+            tool="Write",
+            target="note.txt",
+        )
+
+    @staticmethod
+    def _upd(**kwargs):
+        from claude_agent_sdk.types import PermissionUpdate
+
+        return PermissionUpdate(**kwargs)
+
+    @staticmethod
+    def _rule(tool_name, rule_content=None):
+        from claude_agent_sdk.types import PermissionRuleValue
+
+        return PermissionRuleValue(tool_name=tool_name, rule_content=rule_content)
+
+    # --- _should_persist_allow policy ------------------------------------- #
+
+    def test_empty_updated_permissions_is_not_persist(self):
+        q = self._question()
+        assert PtyCLITransport._should_persist_allow(q, None) is False
+        assert PtyCLITransport._should_persist_allow(q, []) is False
+
+    def test_setmode_is_session_broad(self):
+        q = self._question()
+        upd = [self._upd(type="setMode", mode="acceptEdits")]
+        assert PtyCLITransport._should_persist_allow(q, upd) is True
+
+    def test_broad_session_allow_rule_persists(self):
+        q = self._question()
+        upd = [
+            self._upd(
+                type="addRules",
+                behavior="allow",
+                destination="session",
+                rules=[self._rule("Write")],  # no rule_content -> tool-category broad
+            )
+        ]
+        assert PtyCLITransport._should_persist_allow(q, upd) is True
+
+    def test_narrow_rule_content_does_not_overgrant(self):
+        # "allow Write to /tmp" is narrower than the TUI's "all edits this
+        # session" -> must NOT press persist.
+        q = self._question()
+        upd = [
+            self._upd(
+                type="addRules",
+                behavior="allow",
+                destination="session",
+                rules=[self._rule("Write", rule_content="/tmp/**")],
+            )
+        ]
+        assert PtyCLITransport._should_persist_allow(q, upd) is False
+
+    def test_disk_destination_does_not_persist(self):
+        # The TUI session option cannot express persistence to disk.
+        q = self._question()
+        upd = [
+            self._upd(
+                type="addRules",
+                behavior="allow",
+                destination="userSettings",
+                rules=[self._rule("Write")],
+            )
+        ]
+        assert PtyCLITransport._should_persist_allow(q, upd) is False
+
+    def test_deny_behavior_rule_does_not_persist(self):
+        q = self._question()
+        upd = [
+            self._upd(
+                type="addRules",
+                behavior="deny",
+                destination="session",
+                rules=[self._rule("Write")],
+            )
+        ]
+        assert PtyCLITransport._should_persist_allow(q, upd) is False
+
+    def test_no_persist_option_in_dialog_is_false(self):
+        # Bash-style dialog with no "allow all edits this session" option ->
+        # nothing to press, fall back to allow_once.
+        q = self._question(persist_opt=False)
+        upd = [self._upd(type="setMode", mode="acceptEdits")]
+        assert PtyCLITransport._should_persist_allow(q, upd) is False
+
+    # --- _decide_permission integration ----------------------------------- #
+
+    def test_decide_persist_when_session_broad(self):
+        async def _test():
+            from claude_agent_sdk import PermissionResultAllow
+
+            async def cb(tool, tool_input, ctx):
+                return PermissionResultAllow(
+                    updated_permissions=[self._upd(type="setMode", mode="acceptEdits")]
+                )
+
+            t = make_transport(can_use_tool=cb)
+            decision = await t._decide_permission(self._question())
+            assert decision == "allow_persist"
+
+        anyio.run(_test)
+
+    def test_decide_allow_once_when_no_updated_permissions(self):
+        async def _test():
+            from claude_agent_sdk import PermissionResultAllow
+
+            async def cb(tool, tool_input, ctx):
+                return PermissionResultAllow()  # empty updated_permissions
+
+            t = make_transport(can_use_tool=cb)
+            decision = await t._decide_permission(self._question())
+            assert decision == "allow"
+
+        anyio.run(_test)
+
+    def test_decide_allow_once_when_overgrant_guard_trips(self):
+        async def _test():
+            from claude_agent_sdk import PermissionResultAllow
+
+            async def cb(tool, tool_input, ctx):
+                return PermissionResultAllow(
+                    updated_permissions=[
+                        self._upd(
+                            type="addRules",
+                            behavior="allow",
+                            destination="session",
+                            rules=[self._rule("Write", rule_content="/tmp/**")],
+                        )
+                    ]
+                )
+
+            t = make_transport(can_use_tool=cb)
+            decision = await t._decide_permission(self._question())
+            assert decision == "allow"  # narrow rule -> no over-grant
+
+        anyio.run(_test)
+
+    def test_answer_presses_session_option_index_2(self):
+        # End-to-end through _answer_question: persist intent -> keystroke "2".
+        async def _test():
+            from claude_agent_sdk import PermissionResultAllow
+
+            async def cb(tool, tool_input, ctx):
+                return PermissionResultAllow(
+                    updated_permissions=[self._upd(type="setMode", mode="acceptEdits")]
+                )
+
+            t = make_transport(can_use_tool=cb)
+            writes = _capture_pty_writes(t)
+            await t._answer_question(self._question())
+            joined = b"".join(writes)
+            assert b"2" in joined  # allow_persist option
+            assert writes[-1] == b"\r"
+
+        anyio.run(_test)
+
+    def test_answer_falls_back_to_once_without_persist_option(self):
+        async def _test():
+            from claude_agent_sdk import PermissionResultAllow
+
+            async def cb(tool, tool_input, ctx):
+                return PermissionResultAllow(
+                    updated_permissions=[self._upd(type="setMode", mode="acceptEdits")]
+                )
+
+            t = make_transport(can_use_tool=cb)
+            writes = _capture_pty_writes(t)
+            await t._answer_question(self._question(persist_opt=False))
+            joined = b"".join(writes)
+            assert b"1" in joined  # allow_once, not persist
+            assert b"2" not in joined
+
+        anyio.run(_test)
+
+    def test_session_grant_dialog_answered_at_most_once(self):
+        # SDK-side re-prompt suppression: once the persist dialog is answered the
+        # watch loop records its fingerprint, so a re-detection of the same
+        # dialog is skipped (we never press it twice). This is the SDK-observable
+        # half of "the session grant took effect" -- the TUI honors the press
+        # upstream; the watcher must not fight it by re-answering.
+        async def _test():
+            from claude_agent_sdk import PermissionResultAllow
+
+            calls = 0
+
+            async def cb(tool, tool_input, ctx):
+                nonlocal calls
+                calls += 1
+                return PermissionResultAllow(
+                    updated_permissions=[self._upd(type="setMode", mode="acceptEdits")]
+                )
+
+            t = make_transport(can_use_tool=cb)
+            _capture_pty_writes(t)
+            q = self._question()
+            fp = PtyCLITransport._question_fingerprint(q)
+
+            # First detection: answer + record fingerprint (mirrors the loop body).
+            assert await t._answer_question(q) is True
+            t._answered_questions.add(fp)
+            # Second identical detection would be skipped by the loop's guard.
+            assert fp in t._answered_questions
+            assert calls == 1
+
+        anyio.run(_test)
+
+
 class TestWarmupConfigurable:
     def test_warmup_seconds_is_patchable(self, monkeypatch):
         """Integration tests rely on shrinking the warmup; guard the knob."""

@@ -302,7 +302,7 @@ def parse_question(lines: list[str]) -> DetectedQuestion | None:
 
 
 def choose_option(
-    question: DetectedQuestion, want: Literal["allow", "deny"]
+    question: DetectedQuestion, want: Literal["allow", "allow_persist", "deny"]
 ) -> QuestionOption | None:
     """Pick the option that best expresses an allow/deny decision.
 
@@ -311,9 +311,13 @@ def choose_option(
     chosen :class:`QuestionOption` (whose ``index`` is the digit to type), or
     ``None`` if no suitable option exists.
 
-    Allow prefers a one-shot allow over a persist-all option (least surprising:
-    we do not silently widen permissions for the whole session). Deny prefers an
-    explicit deny/no option.
+    ``"allow"`` prefers a one-shot allow over a persist-all option (least
+    surprising: we do not silently widen permissions for the whole session).
+    ``"allow_persist"`` (RL12) maps a session-broad ``updated_permissions``
+    request onto the TUI's "allow all edits during this session" option; when no
+    such option exists it degrades to one-shot allow (the persisted rule cannot
+    be expressed by keystroke, so we apply this call only and never over-grant).
+    ``"deny"`` prefers an explicit deny/no option.
     """
     if not question.options:
         return None
@@ -324,11 +328,21 @@ def choose_option(
         # Plan dialogs phrase rejection as "keep planning"/"no"; fall back to the
         # last option, which is conventionally the negative choice.
         return question.options[-1]
-    # want == "allow"
     once = [o for o in question.options if o.action == "allow_once"]
+    persist = [o for o in question.options if o.action == "allow_persist"]
+    if want == "allow_persist":
+        # RL12: honor the persist intent via the session-allow option when it
+        # exists; otherwise fall back to one-shot allow (apply this call). The
+        # TUI has no narrower persist affordance, so this never over-grants
+        # beyond what the dialog itself offers.
+        if persist:
+            return persist[0]
+        if once:
+            return once[0]
+        return question.options[0]
+    # want == "allow"
     if once:
         return once[0]
-    persist = [o for o in question.options if o.action == "allow_persist"]
     if persist:
         return persist[0]
     # No clearly-allow option (e.g. an ask form); fall back to the first option.

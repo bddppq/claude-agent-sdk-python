@@ -225,3 +225,29 @@ def test_choose_option_deny_falls_back_to_last() -> None:
 
 def test_choose_option_no_options() -> None:
     assert choose_option(_q(), "allow") is None
+
+
+def test_choose_option_allow_persist_prefers_persist() -> None:
+    # RL12: a session-broad updated_permissions maps onto the persist option.
+    q = _q(
+        QuestionOption(index=1, label="Yes", action="allow_once"),
+        QuestionOption(
+            index=2,
+            label="Yes, allow all edits during this session",
+            action="allow_persist",
+        ),
+        QuestionOption(index=3, label="No", action="deny"),
+    )
+    chosen = choose_option(q, "allow_persist")
+    assert chosen is not None and chosen.index == 2
+
+
+def test_choose_option_allow_persist_falls_back_to_once() -> None:
+    # No persist option in the dialog (e.g. Bash "always allow access to tmp/")
+    # -> degrade to one-shot allow rather than over-granting.
+    q = _q(
+        QuestionOption(index=1, label="Yes", action="allow_once"),
+        QuestionOption(index=2, label="No", action="deny"),
+    )
+    chosen = choose_option(q, "allow_persist")
+    assert chosen is not None and chosen.index == 1
