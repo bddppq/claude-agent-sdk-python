@@ -87,15 +87,11 @@ async def _drive(
         try:
             client = await anyio.connect_tcp("127.0.0.1", monitor.port)
             await client.send(request)
-            got = b""
-            try:
-                while True:
-                    chunk = await client.receive(4096)
-                    if not chunk:
-                        break
-                    got += chunk
-            except anyio.EndOfStream:
-                pass
+            # Read exactly ONE framed response. With keep-alive the relay keeps
+            # the connection open (it no longer closes after each response), so a
+            # read-until-EOF would block; a real client reads its framed response
+            # and then closes (or reuses) the connection.
+            got = await _read_one_response(client)
             await client.aclose()
             # Give the post-forward tee a moment to run (it runs after the
             # response is fully relayed, on the same connection task).
@@ -293,6 +289,223 @@ class TestNonMessagesNotTeed:
         assert got == response
         # Only /v1/messages is teed; /v1/models is relayed silently.
         assert teed == []
+
+
+class TestExactEndpointMatch:
+    """N2: only the exact /v1/messages path is teed; sub-resources are not."""
+
+    async def test_count_tokens_relayed_but_not_teed(self):
+        message = {"input_tokens": 42}
+        raw = json.dumps(message).encode()
+        response = (
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+            b"Content-Length: " + str(len(raw)).encode() + b"\r\n\r\n" + raw
+        )
+        body = b'{"model":"claude-opus-4-8","messages":[]}'
+        request = (
+            b"POST /v1/messages/count_tokens HTTP/1.1\r\n"
+            b"Host: x\r\nContent-Type: application/json\r\n"
+            b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body
+        )
+        teed: list[dict] = []
+        got = await _drive(
+            lambda port: f"http://127.0.0.1:{port}",
+            response,
+            request,
+            teed.append,
+        )
+        # Relayed unchanged, but NOT counted as a model call (no phantom usage).
+        assert got == response
+        assert teed == []
+
+    async def test_batches_relayed_but_not_teed(self):
+        raw = b'{"id":"batch_1"}'
+        response = (
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+            b"Content-Length: " + str(len(raw)).encode() + b"\r\n\r\n" + raw
+        )
+        body = b"{}"
+        request = (
+            b"POST /v1/messages/batches HTTP/1.1\r\nHost: x\r\n"
+            b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body
+        )
+        teed: list[dict] = []
+        await _drive(
+            lambda port: f"http://127.0.0.1:{port}",
+            response,
+            request,
+            teed.append,
+        )
+        assert teed == []
+
+    async def test_messages_with_query_is_teed(self):
+        # The CLI calls /v1/messages?beta=true -- the query must not defeat the
+        # exact-path match.
+        teed: list[dict] = []
+        body = b'{"model":"claude-opus-4-8","messages":[]}'
+        request = (
+            b"POST /v1/messages?beta=true HTTP/1.1\r\n"
+            b"Host: x\r\nContent-Type: application/json\r\n"
+            b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body
+        )
+        await _drive(
+            lambda port: f"http://127.0.0.1:{port}",
+            _sse_response(),
+            request,
+            teed.append,
+        )
+        assert len(teed) == 1
+        assert teed[0]["path"] == "/v1/messages?beta=true"
+
+
+class TestQuotaProbeNotTeed:
+    """RL5: the synthetic quota-check probe is relayed but never teed/billed."""
+
+    async def test_quota_probe_relayed_but_not_teed(self):
+        message = {
+            "id": "m",
+            "model": "claude-opus-4-8",
+            "content": [],
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+        }
+        raw = json.dumps(message).encode()
+        response = (
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+            b"Content-Length: " + str(len(raw)).encode() + b"\r\n\r\n" + raw
+        )
+        probe = b'{"model":"claude-opus-4-8","max_tokens":1,"messages":[{"role":"user","content":"quota"}]}'
+        teed: list[dict] = []
+        got = await _drive(
+            lambda port: f"http://127.0.0.1:{port}",
+            response,
+            _messages_request(probe),
+            teed.append,
+        )
+        # Forwarded byte-for-byte, but not counted (would otherwise inflate cost).
+        assert got == response
+        assert teed == []
+
+    async def test_real_one_token_turn_is_still_teed(self):
+        # A real turn that merely has max_tokens:1 but a non-"quota" message must
+        # NOT be mistaken for the probe.
+        teed: list[dict] = []
+        body = b'{"model":"claude-opus-4-8","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}'
+        await _drive(
+            lambda port: f"http://127.0.0.1:{port}",
+            _sse_response(),
+            _messages_request(body),
+            teed.append,
+        )
+        assert len(teed) == 1
+
+
+class TestKeepAlive:
+    """N1/N3: serve multiple requests on one keep-alive client connection."""
+
+    async def test_two_requests_one_connection(self):
+        body = b'{"model":"claude-opus-4-8","messages":[]}'
+        req = (
+            b"POST /v1/messages HTTP/1.1\r\n"
+            b"Host: original.example\r\n"
+            b"Connection: keep-alive\r\n"
+            b"Content-Type: application/json\r\n"
+            b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body
+        )
+        teed: list[dict] = []
+        upstream = FakeUpstream(_sse_response())
+        async with anyio.create_task_group() as tg:
+            await upstream.start(tg)
+            monitor = ApiMonitor(f"http://127.0.0.1:{upstream.port}", teed.append)
+            await monitor.start()
+            try:
+                client = await anyio.connect_tcp("127.0.0.1", monitor.port)
+                # Send the first request, read its full (Content-Length) response.
+                await client.send(req)
+                resp1 = await _read_one_response(client)
+                # SECOND request on the SAME connection must also be served (N1:
+                # the relay must not have closed after the first response).
+                await client.send(req)
+                resp2 = await _read_one_response(client)
+                await client.aclose()
+                await anyio.sleep(0.05)
+            finally:
+                await monitor.stop()
+                tg.cancel_scope.cancel()
+        assert resp1 == _sse_response()
+        assert resp2 == _sse_response()
+        assert len(upstream.requests) == 2
+        assert len(teed) == 2
+
+    async def test_pipelined_leftover_not_misforwarded(self):
+        # N3: bytes of a SECOND request that arrive glued to the first must not
+        # be forwarded as part of the first upstream request body.
+        body = b'{"model":"claude-opus-4-8","messages":[]}'
+        one = (
+            b"POST /v1/messages HTTP/1.1\r\n"
+            b"Host: x\r\nConnection: keep-alive\r\n"
+            b"Content-Type: application/json\r\n"
+            b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body
+        )
+        teed: list[dict] = []
+        upstream = FakeUpstream(_sse_response())
+        async with anyio.create_task_group() as tg:
+            await upstream.start(tg)
+            monitor = ApiMonitor(f"http://127.0.0.1:{upstream.port}", teed.append)
+            await monitor.start()
+            try:
+                client = await anyio.connect_tcp("127.0.0.1", monitor.port)
+                # Both requests in a single send (pipelined / glued).
+                await client.send(one + one)
+                resp1 = await _read_one_response(client)
+                resp2 = await _read_one_response(client)
+                await client.aclose()
+                await anyio.sleep(0.05)
+            finally:
+                await monitor.stop()
+                tg.cancel_scope.cancel()
+        assert resp1 == _sse_response()
+        assert resp2 == _sse_response()
+        # Each upstream request body is EXACTLY the declared body -- the second
+        # request's bytes were not leaked into the first.
+        assert len(upstream.requests) == 2
+        for _head, up_body in upstream.requests:
+            assert up_body == body
+
+    async def test_connection_close_stops_reuse(self):
+        # A request with Connection: close must be the last one served; the relay
+        # must not block waiting for a follow-up.
+        body = b'{"model":"claude-opus-4-8","messages":[]}'
+        req = (
+            b"POST /v1/messages HTTP/1.1\r\n"
+            b"Host: x\r\nConnection: close\r\n"
+            b"Content-Type: application/json\r\n"
+            b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body
+        )
+        teed: list[dict] = []
+        got = await _drive(
+            lambda port: f"http://127.0.0.1:{port}",
+            _sse_response(),
+            req,
+            teed.append,
+        )
+        assert got == _sse_response()
+        assert len(teed) == 1
+
+
+async def _read_one_response(client: object) -> bytes:
+    """Read exactly one Content-Length-framed HTTP response from ``client``."""
+    buf = b""
+    while b"\r\n\r\n" not in buf:
+        buf += await client.receive(4096)  # type: ignore[attr-defined]
+    head, rest = buf.split(b"\r\n\r\n", 1)
+    length = 0
+    for line in head.split(b"\r\n"):
+        if line.lower().startswith(b"content-length:"):
+            length = int(line.split(b":", 1)[1])
+    body = rest
+    while len(body) < length:
+        body += await client.receive(4096)  # type: ignore[attr-defined]
+    return head + b"\r\n\r\n" + body
 
 
 class TestSseParser:

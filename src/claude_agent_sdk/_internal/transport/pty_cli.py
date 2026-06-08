@@ -1067,7 +1067,16 @@ class PtyCLITransport(Transport):
             # monitor has already seen the assistant's tool_use in the /v1/
             # messages response, so we correlate by tool name to supply the real,
             # complete input (and tool_use_id) the baseline passes.
-            full_input, tool_use_id = self._recover_tool_input(question.tool)
+            #
+            # Deterministic ordering (fixes the RV2 race): the CLI renders this
+            # dialog only AFTER receiving the full /v1/messages response the relay
+            # also fully received, so the tee callback (_on_api_call, which fills
+            # the recovery maps) is guaranteed to run within a small bounded
+            # window. The tee runs on the monitor's serve task in this same event
+            # loop, so we yield to it via a bounded await rather than racing it.
+            full_input, tool_use_id = await self._await_recovered_tool_input(
+                question.tool
+            )
             context = ToolPermissionContext(
                 tool_use_id=tool_use_id,
                 title=question.question,
@@ -1091,6 +1100,35 @@ class PtyCLITransport(Transport):
         # in modes that gate; consumers that need gating should pass can_use_tool
         # or use disallowed_tools / a restrictive permission mode.
         return "allow"
+
+    async def _await_recovered_tool_input(
+        self, tool_name: str, timeout_s: float = 2.0, poll_s: float = 0.02
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        """Bounded-await the recovered full tool input for a blocking dialog (RV2).
+
+        Resolves the RV2 race: the question watcher can detect the permission
+        dialog a few ms before the relay's tee callback has parsed and
+        correlated the assistant's ``tool_use`` from the (already fully relayed)
+        /v1/messages response. Because the CLI only shows the dialog AFTER that
+        full response -- which the relay also fully received -- the tee callback
+        is guaranteed to land within a small bounded window (observed <200ms), so
+        we poll the recovery maps (yielding to the monitor's serve task on the
+        same event loop) up to ``timeout_s`` before giving up. Only when the
+        monitor never started / saw nothing does this fall through to (None, None)
+        and the caller's scraped-``{target}`` fallback.
+        """
+        # Nothing to await for when the monitor is not running -- the recovery
+        # maps will never be populated, so don't burn the timeout.
+        if self._api_monitor is None:
+            return self._recover_tool_input(tool_name)
+        deadline = time.monotonic() + timeout_s
+        while True:
+            full_input, tool_use_id = self._recover_tool_input(tool_name)
+            if full_input is not None:
+                return full_input, tool_use_id
+            if time.monotonic() >= deadline:
+                return full_input, tool_use_id
+            await anyio.sleep(poll_s)
 
     def _recover_tool_input(
         self, tool_name: str

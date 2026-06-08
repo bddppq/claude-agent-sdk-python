@@ -69,6 +69,32 @@ def _split_head(buffer: bytes) -> tuple[bytes, bytes] | None:
     return buffer[: idx + 4], buffer[idx + 4 :]
 
 
+def _split_head_buffered(buffer: bytes) -> tuple[bytes, bytes] | None:
+    """Like :func:`_split_head` but a no-op alias for an already-buffered split.
+
+    Used by the keep-alive loop to detect a complete (pipelined) request head
+    already sitting in the leftover buffer without touching the socket.
+    """
+    return _split_head(buffer)
+
+
+def _wants_close(headers: dict[str, str]) -> bool:
+    """True when a request/response signaled ``Connection: close``."""
+    return "close" in headers.get("connection", "").lower()
+
+
+def _request_has_framing(headers: dict[str, str]) -> bool:
+    """True when a request's body length is known (Content-Length or chunked).
+
+    Without one of these, the relay cannot tell where the body ends, so it
+    cannot safely reuse the connection for a following request -- the caller
+    closes after such a request.
+    """
+    if _content_length(headers) is not None:
+        return True
+    return "chunked" in headers.get("transfer-encoding", "").lower()
+
+
 def _parse_request_head(head: bytes) -> tuple[str, str, dict[str, str]]:
     """Parse a request head into (method, path, headers-lowercased)."""
     lines = head.split(b"\r\n")
@@ -259,23 +285,31 @@ class ApiMonitor:
             logger.debug("API monitor connection relay failed", exc_info=True)
 
     async def _relay_connection(self, client: SocketStream) -> None:
-        # Read the request head so we know the path/headers and how to read the
-        # body. Keep the connection one-request-per-connection: the CLI's HTTP
-        # client opens a fresh connection per call in practice, and closing
-        # after the response is a valid HTTP/1.1 behavior we signal via the
-        # forwarded headers being passed through unchanged.
-        head, rest = await self._read_head(client)
-        if head is None:
-            return
-        method, path, req_headers = _parse_request_head(head)
+        # Honor HTTP/1.1 keep-alive transparently: serve successive requests on
+        # the SAME client connection until the client closes it or a side
+        # signals ``Connection: close`` (N1). The CLI happens to open a fresh
+        # TCP connection per call today, but a pooling client that reuses the
+        # connection -- as keep-alive advertises -- must not see a mid-pool
+        # dropped connection. ``leftover`` carries bytes read past one request's
+        # body into the next request (pipelining) so they are never forwarded as
+        # part of the wrong upstream request (N3).
+        leftover = b""
+        while True:
+            split = _split_head_buffered(leftover)
+            if split is None:
+                head, rest = await self._read_head_from(client, leftover)
+                if head is None:
+                    return
+            else:
+                head, rest = split
+            method, path, req_headers = _parse_request_head(head)
 
-        upstream = await self._connect_upstream()
-        # Real per-call API duration: from just before we forward the request to
-        # just after the full response has been relayed back (R7).
-        started = time.monotonic()
-        try:
+            upstream = await self._connect_upstream()
+            # Real per-call API duration: from just before we forward the request
+            # to just after the full response has been relayed back (R7).
+            started = time.monotonic()
             async with upstream:
-                req_body = await self._relay_request(
+                req_body, leftover = await self._relay_request(
                     client, upstream, head, rest, req_headers
                 )
                 status, resp_headers, resp_body = await self._relay_response(
@@ -292,8 +326,16 @@ class ApiMonitor:
                 resp_body,
                 duration_ms,
             )
-        finally:
-            pass
+
+            # Stop serving this connection when either side asked to close, or
+            # the framing was ambiguous (no Content-Length / not chunked on the
+            # request, i.e. we cannot know where the next request begins).
+            if (
+                _wants_close(req_headers)
+                or _wants_close(resp_headers)
+                or not _request_has_framing(req_headers)
+            ):
+                return
 
     async def _connect_upstream(self) -> ByteStream:
         # ``tls`` is a runtime bool, so mypy cannot pick the right connect_tcp
@@ -312,7 +354,13 @@ class ApiMonitor:
         return cast(ByteStream, stream)
 
     async def _read_head(self, stream: ByteStream) -> tuple[bytes | None, bytes]:
-        buffer = b""
+        return await self._read_head_from(stream, b"")
+
+    async def _read_head_from(
+        self, stream: ByteStream, prefill: bytes
+    ) -> tuple[bytes | None, bytes]:
+        """Read an HTTP head, starting from already-buffered ``prefill`` bytes."""
+        buffer = prefill
         while True:
             split = _split_head(buffer)
             if split is not None:
@@ -332,8 +380,8 @@ class ApiMonitor:
         head: bytes,
         rest: bytes,
         headers: dict[str, str],
-    ) -> bytes:
-        """Forward request head+body to the upstream; return a body copy.
+    ) -> tuple[bytes, bytes]:
+        """Forward request head+body to the upstream; return ``(body, leftover)``.
 
         The body and every header are forwarded byte-for-byte EXCEPT the ``Host``
         header, which is rewritten from the loopback ``127.0.0.1:<port>`` to the
@@ -341,19 +389,49 @@ class ApiMonitor:
         the upstream (and Anthropic's edge) rejects a request whose Host resolves
         to a private/reserved IP (``403 ip_authority_private``). The request
         target path may also be prefixed if the upstream base url had a path.
+
+        ``leftover`` is any bytes read past this request's body (the start of the
+        NEXT pipelined request on a keep-alive connection); they are NOT
+        forwarded to this upstream request (N3) -- the caller feeds them to the
+        next iteration. For a chunked or close-delimited body there is no
+        declared length, so nothing is held back (leftover is empty).
         """
         out_head = _rewrite_request_head(
             head, self._upstream_host, self._upstream_prefix
         )
         await upstream.send(out_head)
         body = bytearray()
+
+        cl = _content_length(headers)
+        if cl is not None:
+            # Length-delimited: forward EXACTLY content-length body bytes; keep
+            # anything beyond as the next request's leading bytes (N3).
+            take = rest[:cl]
+            leftover = rest[cl:]
+            if take:
+                await upstream.send(take)
+                body += take
+            sent = len(take)
+            while sent < cl:
+                try:
+                    chunk = await client.receive(min(_CHUNK, cl - sent))
+                except (anyio.EndOfStream, anyio.ClosedResourceError):
+                    break
+                if not chunk:
+                    break
+                await upstream.send(chunk)
+                if len(body) < _MAX_TEE_BYTES:
+                    body += chunk
+                sent += len(chunk)
+            return bytes(body), bytes(leftover)
+
+        # Chunked or no-framing (e.g. GET) request: forward whatever arrives.
+        # There is no reliable byte boundary for the next request, so the
+        # connection is not reused (the caller checks _request_has_framing).
         if rest:
             await upstream.send(rest)
             body += rest
-
         remaining = self._body_remaining(headers, len(rest))
-        # Read and forward the rest of the body. Bytes are forwarded the instant
-        # they arrive; the copy (for tee) is bounded.
         while remaining != 0:
             try:
                 chunk = await client.receive(_CHUNK)
@@ -368,7 +446,7 @@ class ApiMonitor:
                 remaining -= len(chunk)
                 if remaining <= 0:
                     break
-        return bytes(body)
+        return bytes(body), b""
 
     def _body_remaining(self, headers: dict[str, str], already: int) -> int | None:
         """Bytes of request body still to read, or None for read-to-EOF.
@@ -550,8 +628,14 @@ class ApiMonitor:
         resp_body: bytes,
         duration_ms: int = 0,
     ) -> None:
-        # Only /v1/messages carries the usage/tool/streaming data we enrich from.
-        if "/v1/messages" not in path:
+        # Only the real messages endpoint carries the usage/tool/streaming data
+        # we enrich from. Match the path component EXACTLY (ignoring any query
+        # string such as ``?beta=true``) so sub-resources like
+        # ``/v1/messages/count_tokens`` and ``/v1/messages/batches`` -- which a
+        # substring test would wrongly capture -- are relayed but NOT teed
+        # (count_tokens carries ``{input_tokens}`` with no real turn, which would
+        # inject a phantom call that inflates aggregated tokens/cost). N2.
+        if urlsplit(path).path.rstrip("/") != "/v1/messages":
             return
 
         request_json: dict[str, Any] | None = None
@@ -563,6 +647,16 @@ class ApiMonitor:
                     request_json = parsed
             except (json.JSONDecodeError, ValueError):
                 request_json = None
+
+        # Skip the CLI's synthetic quota/rate-limit *probe* (a /v1/messages POST
+        # with ``max_tokens:1`` and the single literal user message ``"quota"``,
+        # metadata ``user_id`` source ``quota_check``). The baseline never bills
+        # or reports it; teeing it would add a phantom call that can perturb the
+        # turn's duration_api_ms / api_error_status and (if it ever returned 2xx
+        # usage) double-count cost. It is a relay-but-don't-tee call, like a
+        # count_tokens sub-resource. RL5 over-count reconciliation.
+        if _is_quota_probe(request_json):
+            return
 
         # The CLI's responses are gzip-encoded AND chunked-framed -- de-chunk the
         # teed COPY before gunzip+parse (the relayed bytes were forwarded raw and
@@ -591,6 +685,27 @@ class ApiMonitor:
             "partial_text": partial_text,
         }
         self._callback(record)
+
+
+def _is_quota_probe(request_json: dict[str, Any] | None) -> bool:
+    """True for the CLI's synthetic quota-check probe (not a billable turn).
+
+    The CLI fires a tiny ``/v1/messages`` POST to check rate-limit/quota state:
+    ``max_tokens:1`` with exactly one user message whose content is the literal
+    string ``"quota"``. It is never reported in the baseline's usage/cost, so the
+    monitor must relay it (it already did, untouched) but NOT tee it as a model
+    call. Matching is intentionally narrow so a real one-token turn is never
+    dropped.
+    """
+    if not isinstance(request_json, dict):
+        return False
+    if request_json.get("max_tokens") != 1:
+        return False
+    messages = request_json.get("messages")
+    if not isinstance(messages, list) or len(messages) != 1:
+        return False
+    msg = messages[0]
+    return isinstance(msg, dict) and msg.get("content") == "quota"
 
 
 def _parse_headers(head: bytes) -> dict[str, str]:

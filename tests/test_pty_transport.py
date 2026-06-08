@@ -244,6 +244,73 @@ class TestBuildEnv:
 # --------------------------------------------------------------------------- #
 
 
+class TestRecoverToolInputRace:
+    """RV2: the permission path bounded-awaits the relay tee before falling back.
+
+    Reproduces the race the reviewer found (dialog detected before the tee
+    populated the recovery map) and asserts the bounded await resolves it
+    deterministically instead of handing can_use_tool the scraped {target}.
+    """
+
+    def test_await_resolves_after_tee_lands(self):
+        async def _test():
+            t = make_transport()
+            # A monitor must be present for the await to engage (else it would be
+            # pointless to wait -- the maps would never fill).
+            t._api_monitor = object()  # type: ignore[assignment]
+
+            async with anyio.create_task_group() as tg:
+                # Simulate the tee landing ~120ms AFTER the dialog is detected.
+                async def _populate_later() -> None:
+                    await anyio.sleep(0.12)
+                    entry = {
+                        "name": "Write",
+                        "input": {"file_path": "/tmp/rv2.txt", "content": "x"},
+                    }
+                    t._turn_tool_inputs["toolu_real"] = entry
+                    t._turn_tool_input_by_name["Write"] = entry
+
+                tg.start_soon(_populate_later)
+                # At call time the maps are EMPTY (the race window).
+                assert t._recover_tool_input("Write") == (None, None)
+                full_input, tool_use_id = await t._await_recovered_tool_input(
+                    "Write", timeout_s=2.0, poll_s=0.01
+                )
+
+            assert full_input == {"file_path": "/tmp/rv2.txt", "content": "x"}
+            assert tool_use_id == "toolu_real"
+
+        anyio.run(_test)
+
+    def test_await_times_out_to_none_when_never_populated(self):
+        async def _test():
+            t = make_transport()
+            t._api_monitor = object()  # type: ignore[assignment]
+            full_input, tool_use_id = await t._await_recovered_tool_input(
+                "Write", timeout_s=0.1, poll_s=0.01
+            )
+            assert full_input is None
+            assert tool_use_id is None
+
+        anyio.run(_test)
+
+    def test_no_monitor_does_not_wait(self):
+        async def _test():
+            t = make_transport()
+            t._api_monitor = None
+            # With no monitor there is nothing to await: returns immediately.
+            import time as _time
+
+            start = _time.monotonic()
+            result = await t._await_recovered_tool_input(
+                "Write", timeout_s=5.0, poll_s=0.01
+            )
+            assert result == (None, None)
+            assert _time.monotonic() - start < 0.5
+
+        anyio.run(_test)
+
+
 class TestWriteRouting:
     def test_control_request_enqueues_success_response(self):
         async def _test():
