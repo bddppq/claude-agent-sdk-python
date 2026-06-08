@@ -37,11 +37,11 @@ class TestCostForUsage:
             == 5.0
         )
 
-    def test_cache_read_billed_at_calibrated_rate(self):
-        # Calibrated read multiplier (~0.1054) fit to live ground truth, not the
-        # nominal 0.1 -- see _usage._CACHE_READ_MULT.
+    def test_cache_read_billed_at_nominal_rate(self):
+        # NOMINAL published read multiplier 0.1x (R2) -- reproduces the CLI's
+        # per-model costUSD exactly; see _usage._CACHE_READ_MULT.
         cost = cost_for_usage("claude-opus-4-8", {"cache_read_input_tokens": 1_000_000})
-        assert cost == 5.0 * 0.10543
+        assert cost == 5.0 * 0.1
 
     def test_cache_creation_split_5m_1h(self):
         cost = cost_for_usage(
@@ -53,46 +53,44 @@ class TestCostForUsage:
                 }
             },
         )
-        # Both buckets use the calibrated write multiplier (~1.3215).
-        assert cost == 5.0 * 1.32145 + 5.0 * 1.32145
+        # NOMINAL write multipliers: 5m=1.25x, 1h=2.0x (R2).
+        assert cost == 5.0 * 1.25 + 5.0 * 2.0
 
-    def test_flat_cache_creation_billed_at_write_rate(self):
+    def test_flat_cache_creation_billed_at_5m_write_rate(self):
+        # A flat cache_creation_input_tokens (no 5m/1h split) is billed at the
+        # nominal 5-minute write rate.
         cost = cost_for_usage(
             "claude-opus-4-8", {"cache_creation_input_tokens": 1_000_000}
         )
-        assert cost == 5.0 * 1.32145
+        assert cost == 5.0 * 1.25
 
     def test_reproduces_live_ground_truth(self):
-        """The calibrated multipliers reproduce real stream-json totals.
+        """Nominal rates reproduce the CLI's per-model costUSD EXACTLY (R2).
 
-        Four single-API-call ResultMessage points captured live from the old
-        stream-json transport (claude-opus-4-8, acceptEdits). cost_for_usage on
-        each message's usage must match total_cost_usd within a tight tolerance.
+        Ground truth: the live old-SDK ResultMessage ``model_usage`` per-model
+        ``costUSD`` (the opus component, which is what cost_for_usage models).
+        Captured live (claude-opus-4-8, PONG, acceptEdits):
+        usage input=2, output=5, cache_read=16122, cache_creation 5m=1891 ->
+        costUSD=0.02001475. Nominal rates reproduce it to 0.00%. (The previous
+        calibrated multipliers over-counted this opus component by ~5.5% because
+        they were fit to the result-level total, which bundles the unobservable
+        haiku title-gen line -- see R2/R3.)
         """
-        points = [
-            # input, output, cache_read, cache_creation_1h, real_total_cost_usd
-            (1893, 4, 15914, 207, 0.01932175),
-            (1893, 10, 15914, 224, 0.019577),
-            (1893, 5, 15914, 208, 0.019364),
-            (1893, 4, 15914, 11423, 0.09342875),
-        ]
-        for inp, out, cr, cc, real in points:
-            usage = {
-                "input_tokens": inp,
-                "output_tokens": out,
-                "cache_read_input_tokens": cr,
-                "cache_creation_input_tokens": cc,
-                "cache_creation": {
-                    "ephemeral_1h_input_tokens": cc,
-                    "ephemeral_5m_input_tokens": 0,
-                },
-            }
-            computed = cost_for_usage("claude-opus-4-8", usage)
-            assert computed is not None
-            # Within 0.1% of the live total.
-            assert abs(computed - real) / real < 0.001, (
-                f"cc={cc}: computed {computed} vs real {real}"
-            )
+        usage = {
+            "input_tokens": 2,
+            "output_tokens": 5,
+            "cache_read_input_tokens": 16122,
+            "cache_creation_input_tokens": 1891,
+            "cache_creation": {
+                "ephemeral_5m_input_tokens": 1891,
+                "ephemeral_1h_input_tokens": 0,
+            },
+        }
+        computed = cost_for_usage("claude-opus-4-8", usage)
+        assert computed is not None
+        real = 0.02001475
+        # Exact to floating-point tolerance (<0.5% per R2; in practice ~0%).
+        assert abs(computed - real) / real < 0.005, f"computed {computed} vs {real}"
 
     def test_bool_tokens_ignored(self):
         # Guards against True being treated as 1.
@@ -169,9 +167,24 @@ class TestTurnUsageAccumulator:
         acc.add("msg_2", "claude-sonnet-4-6", {"input_tokens": 1_000_000})
         mu = acc.model_usage()
         assert set(mu.keys()) == {"claude-opus-4-8", "claude-sonnet-4-6"}
-        assert mu["claude-opus-4-8"]["input_tokens"] == 1_000_000
-        assert mu["claude-opus-4-8"]["cost_usd"] == 5.0
-        assert mu["claude-sonnet-4-6"]["cost_usd"] == 3.0
+        # camelCase sub-keys matching the real CLI wire format / baseline (R1).
+        assert mu["claude-opus-4-8"]["inputTokens"] == 1_000_000
+        assert mu["claude-opus-4-8"]["costUSD"] == 5.0
+        assert mu["claude-sonnet-4-6"]["costUSD"] == 3.0
+        # contextWindow / maxOutputTokens surfaced like the baseline.
+        assert mu["claude-opus-4-8"]["contextWindow"] == 1_000_000
+        assert mu["claude-opus-4-8"]["maxOutputTokens"] == 64_000
+        # The full baseline camelCase key set is present.
+        assert set(mu["claude-opus-4-8"]) == {
+            "inputTokens",
+            "outputTokens",
+            "cacheReadInputTokens",
+            "cacheCreationInputTokens",
+            "webSearchRequests",
+            "costUSD",
+            "contextWindow",
+            "maxOutputTokens",
+        }
 
     def test_empty_accumulator(self):
         acc = TurnUsageAccumulator()

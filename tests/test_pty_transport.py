@@ -672,7 +672,16 @@ class TestControlMappings:
 
         anyio.run(_test)
 
-    def test_initialize_returns_populated_server_info(self):
+    def test_initialize_returns_server_info_baseline_keyset(self):
+        """initialize control response uses the get_server_info() key set (R5).
+
+        This is the initialize CONTROL-RESPONSE shape (commands /
+        available_output_styles / models / account / pid / agents /
+        output_style), NOT the system/init MESSAGE shape (tools / model /
+        permissionMode). get_server_info() consumers do info.get('commands', [])
+        etc., so every baseline key must be present.
+        """
+
         async def _test():
             t = make_transport(
                 model="claude-opus-4-8",
@@ -690,12 +699,81 @@ class TestControlMappings:
             resp = t._out_recv.receive_nowait()
             assert resp["response"]["subtype"] == "success"
             info = resp["response"]["response"]
-            assert info["model"] == "claude-opus-4-8"
-            assert info["permissionMode"] == "acceptEdits"
-            assert "Read" in info["tools"] and "Write" in info["tools"]
-            # Documented init keys present (not a 5-field stub).
-            for key in ("mcp_servers", "slash_commands", "output_style", "cwd"):
-                assert key in info
+            # Baseline top key set (from a live old-SDK get_server_info()).
+            for key in (
+                "commands",
+                "available_output_styles",
+                "output_style",
+                "models",
+                "account",
+                "agents",
+                "pid",
+            ):
+                assert key in info, f"missing baseline key {key!r}"
+            # Documented .get() defaults are the right container types.
+            assert isinstance(info["commands"], list)
+            assert isinstance(info["available_output_styles"], list)
+            assert isinstance(info["models"], list)
+            assert isinstance(info["account"], dict)
+            assert info["output_style"] == "default"
+            # The system/init MESSAGE shape keys must NOT leak into server info.
+            assert "tools" not in info
+            assert "permissionMode" not in info
+
+        anyio.run(_test)
+
+    def test_initialize_backfills_agents_from_options(self):
+        async def _test():
+            from claude_agent_sdk.types import AgentDefinition
+
+            t = make_transport(
+                agents={
+                    "reviewer": AgentDefinition(
+                        description="d", prompt="p", tools=None, model=None
+                    )
+                }
+            )
+            t._out_send, t._out_recv = anyio.create_memory_object_stream(10)
+            await t._handle_control_request(
+                {
+                    "type": "control_request",
+                    "request_id": "r",
+                    "request": {"subtype": "initialize"},
+                }
+            )
+            info = t._out_recv.receive_nowait()["response"]["response"]
+            assert info["agents"] == [{"name": "reviewer"}]
+
+        anyio.run(_test)
+
+    def test_system_init_message_carries_enriched_fields(self):
+        """The system/init MESSAGE keeps the capability shape (R6)."""
+
+        async def _test():
+            t = make_transport(
+                model="claude-opus-4-8",
+                allowed_tools=["Read", "Write"],
+                permission_mode="acceptEdits",
+            )
+            init = t._build_init_data()
+            assert init["model"] == "claude-opus-4-8"
+            assert init["permissionMode"] == "acceptEdits"
+            assert "Read" in init["tools"] and "Write" in init["tools"]
+            for key in (
+                "mcp_servers",
+                "slash_commands",
+                "output_style",
+                "cwd",
+                "agents",
+                "plugins",
+                "skills",
+            ):
+                assert key in init
+            # Resolved model is backfilled from the first observed assistant
+            # record when the caller didn't pass one.
+            t2 = make_transport()
+            t2._turn_model = "claude-opus-4-8"
+            assert t2._build_init_data()["model"] == "claude-opus-4-8"
 
         anyio.run(_test)
 
@@ -1135,7 +1213,13 @@ class TestResultFidelity:
         # num_turns = tool_results + 1; the snapshot's messageCount (5) is
         # deliberately ignored.
         assert result["num_turns"] == 1
-        assert result["model_usage"]["claude-opus-4-8"]["cost_usd"] == 5.0
+        # Emitted under the camelCase ``modelUsage`` wire key with camelCase
+        # sub-keys so message_parser (data.get("modelUsage")) populates
+        # ResultMessage.model_usage (R1). The snake_case ``model_usage`` key
+        # would silently parse to None at the consumer.
+        assert "model_usage" not in result
+        assert result["modelUsage"]["claude-opus-4-8"]["costUSD"] == 5.0
+        assert result["modelUsage"]["claude-opus-4-8"]["inputTokens"] == 1_000_000
         # permission_denials is always a list (never None), like stream-json.
         assert result["permission_denials"] == []
 
@@ -1436,3 +1520,208 @@ class TestAtexitCleanup:
         pty_cli._ACTIVE_CHILDREN.add(t)
         t._terminate_process()  # no process/fd; must be a safe no-op
         assert t not in pty_cli._ACTIVE_CHILDREN
+
+
+# --------------------------------------------------------------------------- #
+# R1: model_usage wire-key / parser round-trip
+# --------------------------------------------------------------------------- #
+
+
+class TestModelUsageParserRoundTrip:
+    def test_modelusage_key_populates_resultmessage(self, tmp_path):
+        """The synthesized result must populate ResultMessage.model_usage (R1).
+
+        message_parser reads data.get("modelUsage") (camelCase); a snake_case
+        model_usage key parses to None.
+        """
+        from claude_agent_sdk._internal.message_parser import parse_message
+        from claude_agent_sdk.types import ResultMessage
+
+        async def _test():
+            t = make_transport()
+            path = tmp_path / "s.jsonl"
+            path.write_text(
+                "\n".join(
+                    json.dumps(line)
+                    for line in [
+                        {
+                            "type": "assistant",
+                            "sessionId": "s",
+                            "uuid": "a1",
+                            "message": {
+                                "role": "assistant",
+                                "id": "msg_1",
+                                "model": "claude-opus-4-8",
+                                "content": [{"type": "text", "text": "done"}],
+                                "stop_reason": "end_turn",
+                                "usage": {
+                                    "input_tokens": 1_000_000,
+                                    "output_tokens": 0,
+                                },
+                            },
+                        },
+                        {
+                            "type": "system",
+                            "subtype": "turn_duration",
+                            "durationMs": 100,
+                        },
+                    ]
+                )
+                + "\n"
+            )
+            t._transcript_path = path
+            t._out_send, t._out_recv = anyio.create_memory_object_stream(100)
+            t._input_ended = True
+            with anyio.fail_after(5):
+                await t._tail_loop()
+            return _drain(t)
+
+        msgs = anyio.run(_test)
+        result_data = next(m for m in msgs if m["type"] == "result")
+        result_data.setdefault("session_id", "s")
+        parsed = parse_message(result_data)
+        assert isinstance(parsed, ResultMessage)
+        # The whole point of R1: not None at the consumer.
+        assert parsed.model_usage is not None
+        assert parsed.model_usage["claude-opus-4-8"]["costUSD"] == 5.0
+
+
+# --------------------------------------------------------------------------- #
+# R4: interrupt synthesizes a terminating result
+# --------------------------------------------------------------------------- #
+
+
+class TestInterruptResult:
+    def test_interrupt_emits_terminating_result(self):
+        """interrupt() must synthesize a result so receive_response() ends (R4)."""
+
+        async def _test():
+            t = make_transport()
+            t._out_send, t._out_recv = anyio.create_memory_object_stream(100)
+            # Pretend a turn is in flight with some accumulated usage.
+            t._result_emitted = False
+            import time as _time
+
+            t._turn_start_time = _time.monotonic()
+            t._turn_usage.add("msg_1", "claude-opus-4-8", {"input_tokens": 1_000_000})
+            t._turn_tool_results = 1
+            with patch.object(t, "_pty_write", new=_noop_async):
+                await t._handle_control_request(
+                    {
+                        "type": "control_request",
+                        "request_id": "r",
+                        "request": {"subtype": "interrupt"},
+                    }
+                )
+            return _drain(t)
+
+        msgs = anyio.run(_test)
+        # ACK control_response is success.
+        ctrl = next(m for m in msgs if m["type"] == "control_response")
+        assert ctrl["response"]["subtype"] == "success"
+        # A terminating result is synthesized, mirroring the stream-json baseline.
+        result = next(m for m in msgs if m["type"] == "result")
+        assert result["subtype"] == "error_during_execution"
+        assert result["is_error"] is True
+        assert result["result"] is None
+        assert result["stop_reason"] is None
+        assert result["num_turns"] == 2  # tool_results(1) + 1
+        # Accumulated usage carried through.
+        assert result["usage"]["input_tokens"] == 1_000_000
+
+    def test_interrupt_does_not_double_emit(self):
+        async def _test():
+            t = make_transport()
+            t._out_send, t._out_recv = anyio.create_memory_object_stream(100)
+            t._result_emitted = True  # a result already went out this turn
+            with patch.object(t, "_pty_write", new=_noop_async):
+                await t._handle_control_request(
+                    {
+                        "type": "control_request",
+                        "request_id": "r",
+                        "request": {"subtype": "interrupt"},
+                    }
+                )
+            return _drain(t)
+
+        msgs = anyio.run(_test)
+        assert not any(m["type"] == "result" for m in msgs)
+
+
+async def _noop_async(*_args, **_kwargs):
+    return None
+
+
+# --------------------------------------------------------------------------- #
+# R8: --include-hook-events is honored at the CLI level
+# --------------------------------------------------------------------------- #
+
+
+class TestIncludeHookEvents:
+    def test_flag_passed_to_cli(self):
+        from claude_agent_sdk._internal.transport import _cli_command
+
+        cmd = _cli_command.build_command(
+            DEFAULT_CLI,
+            ClaudeAgentOptions(include_hook_events=True),
+            "sess",
+        )
+        assert "--include-hook-events" in cmd
+
+    def test_flag_absent_by_default(self):
+        from claude_agent_sdk._internal.transport import _cli_command
+
+        cmd = _cli_command.build_command(DEFAULT_CLI, ClaudeAgentOptions(), "sess")
+        assert "--include-hook-events" not in cmd
+
+
+# --------------------------------------------------------------------------- #
+# R9: bounded _seen_uuids
+# --------------------------------------------------------------------------- #
+
+
+class TestSeenUuidsBounded:
+    def test_seen_uuids_capped(self, tmp_path):
+        async def _test():
+            t = make_transport()
+            path = tmp_path / "s.jsonl"
+            # Emit more distinct-uuid records than the cap; assistant records are
+            # the simplest record type that goes through the dedup path.
+            n = pty_cli._SEEN_UUIDS_MAX + 50
+            lines = [
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "sessionId": "s",
+                        "uuid": f"u{i}",
+                        "message": {
+                            "role": "assistant",
+                            "id": f"m{i}",
+                            "model": "claude-opus-4-8",
+                            "content": [{"type": "text", "text": "x"}],
+                        },
+                    }
+                )
+                for i in range(n)
+            ]
+            # Terminate the tail loop with a turn_duration so it stops spinning.
+            lines.append(
+                json.dumps(
+                    {
+                        "type": "system",
+                        "subtype": "turn_duration",
+                        "uuid": "td",
+                        "durationMs": 1,
+                    }
+                )
+            )
+            path.write_text("\n".join(lines) + "\n")
+            t._transcript_path = path
+            t._out_send, t._out_recv = anyio.create_memory_object_stream(n + 10)
+            t._input_ended = True
+            with anyio.fail_after(15):
+                await t._tail_loop()
+            return len(t._seen_uuids)
+
+        size = anyio.run(_test)
+        assert size <= pty_cli._SEEN_UUIDS_MAX

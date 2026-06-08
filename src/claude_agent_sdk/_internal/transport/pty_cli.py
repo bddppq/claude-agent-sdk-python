@@ -50,6 +50,7 @@ import termios
 import time
 import tty
 import uuid
+from collections import OrderedDict
 from collections.abc import AsyncIterable, AsyncIterator
 from pathlib import Path
 from subprocess import Popen
@@ -130,6 +131,12 @@ _PASTE_END = b"\x1b[201~"
 # previous 3.0s was conservative headroom; 1.5s keeps margin over the observed
 # floor while halving startup latency.
 _WARMUP_SECONDS = 1.5
+
+# Upper bound on the per-record uuid dedup set (R9). Re-reads only revisit the
+# transcript tail after a compaction/rewrite, so retaining a generous recent
+# window is sufficient to prevent double-emits while keeping memory bounded for
+# a long-lived multi-turn client.
+_SEEN_UUIDS_MAX = 2_048
 
 # Order the TUI cycles through on shift+tab. bypassPermissions is not part of
 # the cycle (it is only reachable via launch flag), so it cannot be set live.
@@ -324,7 +331,17 @@ class PtyCLITransport(Transport):
         self._server_info: dict[str, Any] | None = None
         # Dedup transcript records by uuid so a mid-session compaction/rewrite
         # (which resets the read offset) cannot re-emit already-seen messages.
-        self._seen_uuids: set[str] = set()
+        # Bounded (R9): a long-lived multi-turn client would otherwise retain
+        # every record's uuid for the transport's whole life. We keep the most
+        # recent ``_SEEN_UUIDS_MAX`` in insertion order and drop the oldest;
+        # re-reads only ever revisit the *tail* of the transcript (after a
+        # compaction/rewrite), so an old uuid evicted from the front cannot
+        # reappear and be wrongly re-emitted.
+        self._seen_uuids: OrderedDict[str, None] = OrderedDict()
+        # Monotonic time the current turn's prompt was submitted, used to derive
+        # a faithful ``duration_ms`` if the turn ends without a turn_duration
+        # record (e.g. an interrupt). ``None`` when no turn is in flight.
+        self._turn_start_time: float | None = None
         # Dedup assistant messages by message.id: the transcript writes several
         # streaming snapshots per assistant message (same id, distinct uuid), so
         # uuid dedup alone would emit the same assistant message multiple times.
@@ -459,16 +476,67 @@ class PtyCLITransport(Transport):
                     entry["type"] = cfg["type"]
                 mcp_servers.append(entry)
 
+        agents: list[dict[str, Any]] = []
+        if isinstance(o.agents, dict):
+            agents = [{"name": name} for name in o.agents]
+
+        # Resolved model: prefer the model observed on the first assistant
+        # record of the session (the CLI's actually-resolved model, R6); fall
+        # back to the caller's requested model. The init message is emitted at
+        # connect before any transcript record, so on the first connect this is
+        # ``options.model``; later reconstructions pick up the observed model.
+        model = self._turn_model or o.model or ""
+
         return {
             "session_id": self._observed_session_id or self._session_id,
             "cwd": self._cwd,
             "tools": tools,
             "mcp_servers": mcp_servers,
-            "model": o.model or "",
+            "model": model,
             "permissionMode": self._permission_mode,
             "apiKeySource": "none",
             "slash_commands": [],
             "output_style": "default",
+            # Additional baseline system/init keys, surfaced with safe defaults
+            # so consumers reading them don't see missing keys (R6). The
+            # transcript carries no init record, so the catalogs (plugins,
+            # skills, full command/tool lists) and toggles are not
+            # PTY-observable; agents is backfilled from options.
+            "agents": agents,
+            "plugins": [],
+            "skills": [],
+        }
+
+    def _build_server_info(self) -> dict[str, Any]:
+        """Build the ``initialize`` control-response / ``get_server_info`` payload.
+
+        This is the shape ``client.get_server_info()`` returns -- the real
+        ``initialize`` CONTROL RESPONSE, which has a DIFFERENT key set than the
+        ``system/init`` MESSAGE (R5). The baseline top keys are ``account``,
+        ``agents``, ``available_output_styles``, ``commands``, ``models``,
+        ``output_style`` and ``pid``. Consumers do ``info.get('commands', [])``
+        / ``info.get('output_style')`` etc., so every baseline key is present
+        with a list/dict default even where the value is not PTY-observable.
+
+        Observable values are populated: ``pid`` is the live CLI subprocess pid;
+        ``agents`` is backfilled from ``options.agents`` when the caller defined
+        any. The slash-command catalog, model catalog and account identity are
+        only available over the deleted stream-json ``initialize`` channel (the
+        transcript has no init record), so those default to empty rather than
+        being fabricated.
+        """
+        agents: list[dict[str, Any]] = []
+        if isinstance(self._options.agents, dict):
+            agents = [{"name": name} for name in self._options.agents]
+
+        return {
+            "commands": [],
+            "available_output_styles": ["default"],
+            "output_style": "default",
+            "models": [],
+            "account": {},
+            "agents": agents,
+            "pid": self._proc.pid if self._proc is not None else None,
         }
 
     def _validate_options(self) -> None:
@@ -520,7 +588,11 @@ class PtyCLITransport(Transport):
             )
         if o.include_hook_events:
             logger.warning(
-                "include_hook_events has no effect with the interactive transport."
+                "include_hook_events is passed to the CLI but yields no "
+                "HookEventMessage objects with the interactive transport: the "
+                "CLI emits hook lifecycle events only on the stream-json stdout "
+                "channel, not into the transcript the PTY tails (verified "
+                "empirically -- no hook records appear in the transcript)."
             )
         if o.stderr is not None:
             logger.warning(
@@ -956,11 +1028,15 @@ class PtyCLITransport(Transport):
             self._observed_session_id = sid
 
         # Dedup by uuid so a compaction-triggered re-read can't double-emit.
+        # Bounded LRU-by-insertion (R9): cap the set so a long interactive
+        # session doesn't retain every record forever.
         uid = entry.get("uuid")
         if isinstance(uid, str):
             if uid in self._seen_uuids:
                 return
-            self._seen_uuids.add(uid)
+            self._seen_uuids[uid] = None
+            while len(self._seen_uuids) > _SEEN_UUIDS_MAX:
+                self._seen_uuids.popitem(last=False)
 
         # turn_duration is the turn-complete signal -> synthesize a result that
         # carries the turn's final text, accumulated usage, and error state.
@@ -1064,7 +1140,12 @@ class PtyCLITransport(Transport):
                 result["total_cost_usd"] = cost
             model_usage = self._turn_usage.model_usage()
             if model_usage is not None:
-                result["model_usage"] = model_usage
+                # Emit under the camelCase ``modelUsage`` wire key: the real CLI
+                # uses that key and ``message_parser.parse_message`` reads
+                # ``data.get("modelUsage")`` (R1). Writing snake_case
+                # ``model_usage`` here made ``ResultMessage.model_usage`` always
+                # None at the consumer.
+                result["modelUsage"] = model_usage
         # permission_denials: empty list (faithful default; stream-json always
         # sent a list, never None, so formatting that iterates it works).
         result["permission_denials"] = list(self._turn_permission_denials)
@@ -1076,7 +1157,10 @@ class PtyCLITransport(Transport):
             result["structured_output"] = structured
         self._result_emitted = True
         await self._send(result)
-        # Reset per-turn accumulators for the next turn.
+        self._reset_turn_state()
+
+    def _reset_turn_state(self) -> None:
+        """Reset per-turn accumulators for the next turn."""
         self._turn_text = ""
         self._turn_usage = TurnUsageAccumulator()
         self._turn_is_error = False
@@ -1085,6 +1169,52 @@ class PtyCLITransport(Transport):
         self._turn_tool_results = 0
         self._seen_assistant_ids = set()
         self._turn_permission_denials = []
+        self._turn_start_time = None
+
+    async def _emit_interrupt_result(self) -> None:
+        """Synthesize a terminating result after an ``interrupt`` (R4).
+
+        ESC aborts the in-progress turn, so the CLI never writes a
+        ``turn_duration`` record and ``_emit_result`` never fires. The
+        stream-json baseline produced an ``error_during_execution`` result on
+        interrupt so ``receive_response()`` terminates; without one the
+        documented interrupt pattern hangs forever. We mirror the baseline:
+        ``subtype=error_during_execution``, ``is_error=True``, ``result=None``,
+        carrying whatever usage/turn count accumulated before the abort.
+        """
+        if self._result_emitted:
+            return
+        self._turn_count += 1
+        duration = 0
+        if self._turn_start_time is not None:
+            duration = int((time.monotonic() - self._turn_start_time) * 1000)
+        result: dict[str, Any] = {
+            "type": "result",
+            "subtype": "error_during_execution",
+            "duration_ms": duration,
+            "duration_api_ms": duration,
+            "is_error": True,
+            # Each tool round-trip already happened; +1 for the aborted turn,
+            # matching the baseline's interrupt num_turns shape.
+            "num_turns": self._turn_tool_results + 1,
+            "session_id": self._observed_session_id or self._session_id,
+            # Baseline interrupt result carries no text and no stop_reason.
+            "result": None,
+            "stop_reason": None,
+            "uuid": str(uuid.uuid4()),
+        }
+        if self._turn_usage.has_data():
+            result["usage"] = self._turn_usage.aggregate_usage()
+            cost = self._turn_usage.total_cost()
+            if cost is not None:
+                result["total_cost_usd"] = cost
+            model_usage = self._turn_usage.model_usage()
+            if model_usage is not None:
+                result["modelUsage"] = model_usage
+        result["permission_denials"] = list(self._turn_permission_denials)
+        self._result_emitted = True
+        await self._send(result)
+        self._reset_turn_state()
 
     def _extract_structured_output(self) -> Any | None:
         """Parse the turn's final text as structured output, if requested.
@@ -1172,12 +1302,17 @@ class PtyCLITransport(Transport):
 
         try:
             if subtype == "initialize":
-                # Return populated server info (C3) so get_server_info() is not
-                # empty. No interactive action is needed.
-                payload = self._build_init_data()
+                # Return the initialize CONTROL-RESPONSE shape (R5) -- the key
+                # set get_server_info() consumers expect (commands,
+                # available_output_styles, models, account, pid, agents,
+                # output_style) -- NOT the system/init MESSAGE shape.
+                payload = self._build_server_info()
             elif subtype == "interrupt":
                 async with self._write_lock:
                     await self._pty_write(_INTERRUPT)
+                # ESC aborts the turn with no turn_duration record, so synthesize
+                # a terminating result (R4) or receive_response() hangs forever.
+                await self._emit_interrupt_result()
             elif subtype == "set_permission_mode":
                 error = await self._set_permission_mode(request.get("mode"))
             elif subtype == "set_model":
@@ -1335,6 +1470,11 @@ class PtyCLITransport(Transport):
         if text[:1] in ("/", "!", "#"):
             text = " " + text
         payload = _PASTE_START + text.encode("utf-8") + _PASTE_END
+        # A new turn is starting: mark it in flight and reset the
+        # turn-complete latch so an interrupt or turn_duration for this turn can
+        # synthesize a result.
+        self._turn_start_time = time.monotonic()
+        self._result_emitted = False
         async with self._write_lock:
             await self._pty_write(payload)
             await anyio.sleep(0.3)

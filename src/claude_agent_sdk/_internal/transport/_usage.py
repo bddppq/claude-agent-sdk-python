@@ -21,11 +21,13 @@ transcript:
   totals and computed cost.
 
 Pricing table (USD per million tokens) is small and clearly marked for
-maintenance. Cache multipliers are calibrated against live stream-json
-``total_cost_usd`` ground truth (see ``_CACHE_*_MULT`` below), not just the
-nominal published rates -- the published 0.1x read / 1.25x 5m-write / 2x
-1h-write rates over-estimate the CLI's billed cost by ~1.4%, so the multipliers
-here are fit to reproduce the real result to within ~0.06%.
+maintenance. Cache multipliers are Anthropic's NOMINAL published rates (0.1x
+read / 1.25x 5m-write / 2x 1h-write, see ``_CACHE_*_MULT`` below) -- they
+reproduce the CLI's per-model ``costUSD`` EXACTLY (0.00% on a live opus turn).
+The only residual against the result-level ``total_cost_usd`` is the CLI's
+un-observable haiku title-generation line (~0.0005/turn), which is not in the
+transcript and leaves the PTY total slightly under the baseline rather than
+over -- the faithful direction.
 """
 
 from __future__ import annotations
@@ -42,22 +44,52 @@ _PRICING_PER_MTOK: dict[str, dict[str, float]] = {
     "haiku": {"input": 1.0, "output": 5.0},
 }
 
+# Per-family context-window / max-output metadata, surfaced in the camelCase
+# ``modelUsage`` breakdown (``contextWindow`` / ``maxOutputTokens``) to match the
+# stream-json baseline shape. Values mirror what the live CLI reports for each
+# family; opus (4.x) advertises a 1M context window in this environment.
+_MODEL_LIMITS: dict[str, dict[str, int]] = {
+    "opus": {"contextWindow": 1_000_000, "maxOutputTokens": 64_000},
+    "sonnet": {"contextWindow": 1_000_000, "maxOutputTokens": 64_000},
+    "haiku": {"contextWindow": 200_000, "maxOutputTokens": 32_000},
+}
+
+
+def _limits_for(model: str | None) -> dict[str, int] | None:
+    if not model:
+        return None
+    low = model.lower()
+    for family, limits in _MODEL_LIMITS.items():
+        if family in low:
+            return limits
+    return None
+
+
 # Cache multipliers relative to the model's base input price.
 #
-# These are CALIBRATED to live stream-json ``total_cost_usd`` ground truth, not
-# the nominal published rates. Solving four live single-API-call result points
-# (same model, varying cache_creation so the read term cancels) gives an
-# effective read multiplier of ~0.1054 and an effective 1h-write multiplier of
-# ~1.3215 -- each ~5.5% above the nominal 0.1 / 1.25 ("ephemeral_1h" tokens are
-# billed close to the 5-minute write rate here, not the nominal 2x). The
-# nominal rates over-estimate by ~1.4%; these reproduce the four points to
-# within ~0.06%. The 5m-write multiplier tracks the 1h one at the same ~5.5%
-# offset over its 1.25 nominal (no live 5m-only data point is available to
-# separate them, and in practice the CLI writes all cache_creation to one
-# bucket per message). MAINTENANCE: re-fit if billed pricing changes.
-_CACHE_READ_MULT = 0.10543
-_CACHE_WRITE_5M_MULT = 1.32145
-_CACHE_WRITE_1H_MULT = 1.32145
+# These are Anthropic's NOMINAL published prompt-caching rates:
+#   * cache read       = 0.1x  the base input price
+#   * 5-minute write   = 1.25x the base input price
+#   * 1-hour write     = 2.0x  the base input price
+#
+# The nominal rates reproduce the CLI's per-model ``costUSD`` EXACTLY. Verified
+# against a live single-API-call opus turn (PONG): usage
+# ``input=2, output=5, cache_read=16122, cache_creation 5m=1891`` ->
+# ``2*5/1e6 + 5*25/1e6 + 16122*5/1e6*0.1 + 1891*5/1e6*1.25 = 0.02001475`` which
+# equals the CLI's reported ``model_usage["claude-opus-4-8"]["costUSD"]`` of
+# 0.02001475 to 0.00%.
+#
+# A previous calibration back-solved these against the *result-level*
+# ``total_cost_usd`` instead -- but that total bundles an unobservable haiku
+# title-generation line (~0.0005/turn), so fitting opus cache multipliers to it
+# inflated read 0.1->0.10543 / write 1.25->1.32145 and over-counted the opus
+# component by ~5.5%. The nominal rates make the opus component exact; the only
+# residual is the un-observable helper-model line, which leaves the PTY total
+# slightly UNDER the baseline (the faithful direction) rather than over.
+# MAINTENANCE: update only if Anthropic's published cache rates change.
+_CACHE_READ_MULT = 0.1
+_CACHE_WRITE_5M_MULT = 1.25
+_CACHE_WRITE_1H_MULT = 2.0
 
 # Token-count usage keys we sum when aggregating a turn's usage. Nested dicts
 # (cache_creation, server_tool_use) and non-numeric metadata are merged
@@ -210,7 +242,16 @@ class TurnUsageAccumulator:
         return total if any_known else None
 
     def model_usage(self) -> dict[str, Any] | None:
-        """Per-model token + cost breakdown, mirroring stream-json ``modelUsage``."""
+        """Per-model token + cost breakdown, mirroring stream-json ``modelUsage``.
+
+        Keyed by model id, with the EXACT camelCase sub-keys the real CLI wire
+        format / ``message_parser`` and baseline use:
+        ``inputTokens``, ``outputTokens``, ``cacheReadInputTokens``,
+        ``cacheCreationInputTokens``, ``webSearchRequests``, ``costUSD``,
+        ``contextWindow``, ``maxOutputTokens``. (The result-level field is also
+        emitted under the camelCase ``modelUsage`` key so the parser picks it
+        up -- see ``pty_cli._emit_result``.)
+        """
         entries = self._entries()
         if not entries:
             return None
@@ -220,16 +261,30 @@ class TurnUsageAccumulator:
             bucket = out.setdefault(
                 key,
                 {
-                    "input_tokens": 0,
-                    "output_tokens": 0,
-                    "cache_creation_input_tokens": 0,
-                    "cache_read_input_tokens": 0,
-                    "cost_usd": 0.0,
+                    "inputTokens": 0,
+                    "outputTokens": 0,
+                    "cacheReadInputTokens": 0,
+                    "cacheCreationInputTokens": 0,
+                    "webSearchRequests": 0,
+                    "costUSD": 0.0,
                 },
             )
-            for k in _NUMERIC_USAGE_KEYS:
-                bucket[k] += _as_int(usage.get(k))
+            bucket["inputTokens"] += _as_int(usage.get("input_tokens"))
+            bucket["outputTokens"] += _as_int(usage.get("output_tokens"))
+            bucket["cacheReadInputTokens"] += _as_int(
+                usage.get("cache_read_input_tokens")
+            )
+            bucket["cacheCreationInputTokens"] += _as_int(
+                usage.get("cache_creation_input_tokens")
+            )
+            stu = usage.get("server_tool_use")
+            if isinstance(stu, dict):
+                bucket["webSearchRequests"] += _as_int(stu.get("web_search_requests"))
             c = cost_for_usage(model, usage)
             if c is not None:
-                bucket["cost_usd"] += c
+                bucket["costUSD"] += c
+            limits = _limits_for(model)
+            if limits is not None:
+                bucket["contextWindow"] = limits["contextWindow"]
+                bucket["maxOutputTokens"] = limits["maxOutputTokens"]
         return out

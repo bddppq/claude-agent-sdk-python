@@ -265,6 +265,17 @@ def build_command(
     if options.strict_mcp_config:
         cmd.append("--strict-mcp-config")
 
+    # Honor --include-hook-events at the CLI level like the stream-json baseline
+    # did, rather than silently dropping it (R8). NOTE: empirically the
+    # interactive CLI does NOT write hook lifecycle records to the transcript
+    # even with this flag (it emits them only on the stream-json stdout channel
+    # the PTY cannot read), so consumers still won't receive HookEventMessage
+    # objects -- pty_cli._validate_options warns about that. Passing the flag is
+    # still the faithful drop-in: it is accepted by the CLI and keeps behavior
+    # closest to the baseline command line.
+    if options.include_hook_events:
+        cmd.append("--include-hook-events")
+
     if options.fork_session:
         cmd.append("--fork-session")
 
