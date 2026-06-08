@@ -21,8 +21,11 @@ transcript:
   totals and computed cost.
 
 Pricing table (USD per million tokens) is small and clearly marked for
-maintenance. Cache reads bill at ~0.1x input; 5-minute cache writes at 1.25x
-input; 1-hour cache writes at 2x input (see Anthropic prompt-caching pricing).
+maintenance. Cache multipliers are calibrated against live stream-json
+``total_cost_usd`` ground truth (see ``_CACHE_*_MULT`` below), not just the
+nominal published rates -- the published 0.1x read / 1.25x 5m-write / 2x
+1h-write rates over-estimate the CLI's billed cost by ~1.4%, so the multipliers
+here are fit to reproduce the real result to within ~0.06%.
 """
 
 from __future__ import annotations
@@ -40,9 +43,21 @@ _PRICING_PER_MTOK: dict[str, dict[str, float]] = {
 }
 
 # Cache multipliers relative to the model's base input price.
-_CACHE_READ_MULT = 0.1
-_CACHE_WRITE_5M_MULT = 1.25
-_CACHE_WRITE_1H_MULT = 2.0
+#
+# These are CALIBRATED to live stream-json ``total_cost_usd`` ground truth, not
+# the nominal published rates. Solving four live single-API-call result points
+# (same model, varying cache_creation so the read term cancels) gives an
+# effective read multiplier of ~0.1054 and an effective 1h-write multiplier of
+# ~1.3215 -- each ~5.5% above the nominal 0.1 / 1.25 ("ephemeral_1h" tokens are
+# billed close to the 5-minute write rate here, not the nominal 2x). The
+# nominal rates over-estimate by ~1.4%; these reproduce the four points to
+# within ~0.06%. The 5m-write multiplier tracks the 1h one at the same ~5.5%
+# offset over its 1.25 nominal (no live 5m-only data point is available to
+# separate them, and in practice the CLI writes all cache_creation to one
+# bucket per message). MAINTENANCE: re-fit if billed pricing changes.
+_CACHE_READ_MULT = 0.10543
+_CACHE_WRITE_5M_MULT = 1.32145
+_CACHE_WRITE_1H_MULT = 1.32145
 
 # Token-count usage keys we sum when aggregating a turn's usage. Nested dicts
 # (cache_creation, server_tool_use) and non-numeric metadata are merged

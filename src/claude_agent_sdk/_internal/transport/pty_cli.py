@@ -125,7 +125,11 @@ _PASTE_END = b"\x1b[201~"
 # Seconds to let the interactive TUI render before the first prompt is typed.
 # The CLI shows a transient startup toast that swallows the first Enter; we wait
 # this long, then send one dismissal Enter. Module-level so tests can shrink it.
-_WARMUP_SECONDS = 3.0
+# Tightened from 3.0 -> 1.5 (L1): live-verified that the first prompt still
+# submits reliably at 1.5s across repeated runs (and even at 1.0s), so the
+# previous 3.0s was conservative headroom; 1.5s keeps margin over the observed
+# floor while halving startup latency.
+_WARMUP_SECONDS = 1.5
 
 # Order the TUI cycles through on shift+tab. bypassPermissions is not part of
 # the cycle (it is only reachable via launch flag), so it cannot be set live.
@@ -204,6 +208,16 @@ def _sanitize_assistant_message(message: dict[str, Any]) -> dict[str, Any]:
                 block.setdefault("signature", "")
     message.setdefault("model", "unknown")
     return message
+
+
+def _has_tool_result(message: Any) -> bool:
+    """True if a user message carries at least one tool_result block."""
+    if not isinstance(message, dict):
+        return False
+    content = message.get("content")
+    if not isinstance(content, list):
+        return False
+    return any(isinstance(b, dict) and b.get("type") == "tool_result" for b in content)
 
 
 def _extract_text(message: dict[str, Any]) -> str:
@@ -292,9 +306,14 @@ class PtyCLITransport(Transport):
         self._turn_subtype: str | None = None
         self._turn_stop_reason: str | None = None
         self._turn_model: str | None = None
-        # Count of assistant + tool-result messages in the current turn, used as
-        # a fallback for num_turns when the CLI's messageCount is unavailable.
-        self._turn_messages = 0
+        # Count of tool-result user records in the current turn. num_turns is
+        # (tool_result_count + 1): each tool result is one API round-trip back
+        # to the model, plus the final answer turn. Verified against live
+        # stream-json num_turns over many prompts (PONG=1/0 results, 2-write+
+        # 2-read=8/7 results, etc.) -- the transcript's turn_duration
+        # ``messageCount`` counts streamed snapshots, NOT API turns, so it must
+        # not be used here.
+        self._turn_tool_results = 0
         # Permission denials observed in the current turn (answered "deny" via
         # the TUI question detector). Surfaced on the result like stream-json.
         self._turn_permission_denials: list[dict[str, Any]] = []
@@ -306,6 +325,10 @@ class PtyCLITransport(Transport):
         # Dedup transcript records by uuid so a mid-session compaction/rewrite
         # (which resets the read offset) cannot re-emit already-seen messages.
         self._seen_uuids: set[str] = set()
+        # Dedup assistant messages by message.id: the transcript writes several
+        # streaming snapshots per assistant message (same id, distinct uuid), so
+        # uuid dedup alone would emit the same assistant message multiple times.
+        self._seen_assistant_ids: set[str] = set()
 
     # ------------------------------------------------------------------ #
     # Connection lifecycle
@@ -960,18 +983,28 @@ class PtyCLITransport(Transport):
             stop_reason = msg.get("stop_reason")
             if isinstance(stop_reason, str):
                 self._turn_stop_reason = stop_reason
-            self._turn_usage.add(msg.get("id"), model, msg.get("usage"))
-            # Each assistant message is a CLI "turn" (API round-trip); count
-            # them so num_turns matches the stream-json baseline, which counts
-            # API turns rather than user prompts.
-            self._turn_messages += 1
+            # Dedup by message.id: the interactive transcript writes MULTIPLE
+            # snapshots of the same assistant message as it streams (same
+            # message.id, distinct top-level uuid), so the uuid dedup above does
+            # not collapse them. add() keeps only the final snapshot per id, and
+            # we suppress re-emitting an already-seen assistant id to consumers
+            # so the same message is not delivered several times.
+            msg_id = msg.get("id")
+            self._turn_usage.add(msg_id, model, msg.get("usage"))
             err = msg.get("error")
             if err or stop_reason == "refusal":
                 self._turn_is_error = True
                 self._turn_subtype = self._error_subtype(err, stop_reason)
+            if isinstance(msg_id, str) and msg_id:
+                if msg_id in self._seen_assistant_ids:
+                    return  # already emitted this assistant message; drop snapshot
+                self._seen_assistant_ids.add(msg_id)
         elif entry_type == "user":
-            # Tool-result user records are also turns in the CLI's accounting.
-            self._turn_messages += 1
+            # num_turns counts API round-trips: each tool_result user record is
+            # the model being called again with the tool output. Counted here;
+            # num_turns = tool_results + 1 (the final answer turn).
+            if _has_tool_result(message.get("message")):
+                self._turn_tool_results += 1
 
         await self._send(message)
 
@@ -996,14 +1029,12 @@ class PtyCLITransport(Transport):
         """Synthesize and emit a result from a ``turn_duration`` record."""
         self._turn_count += 1
         duration = entry.get("durationMs", 0)
-        # num_turns: prefer the CLI's own messageCount for the turn (matches the
-        # stream-json baseline, which counts API turns, not user prompts);
-        # fall back to the assistant/tool-result messages we observed.
-        message_count = entry.get("messageCount")
-        if isinstance(message_count, int) and message_count > 0:
-            num_turns = message_count
-        else:
-            num_turns = max(self._turn_messages, 1)
+        # num_turns = (tool_result records this turn) + 1. Each tool_result is
+        # one API round-trip back to the model; the +1 is the final answer turn.
+        # Verified against live stream-json num_turns across many prompts. The
+        # turn_duration record's own ``messageCount`` counts streamed snapshots
+        # (NOT API turns) and over-counts badly, so it is deliberately not used.
+        num_turns = self._turn_tool_results + 1
 
         subtype = (
             (self._turn_subtype or "error_during_execution")
@@ -1051,7 +1082,8 @@ class PtyCLITransport(Transport):
         self._turn_is_error = False
         self._turn_subtype = None
         self._turn_stop_reason = None
-        self._turn_messages = 0
+        self._turn_tool_results = 0
+        self._seen_assistant_ids = set()
         self._turn_permission_denials = []
 
     def _extract_structured_output(self) -> Any | None:

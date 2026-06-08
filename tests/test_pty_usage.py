@@ -37,9 +37,11 @@ class TestCostForUsage:
             == 5.0
         )
 
-    def test_cache_read_billed_at_tenth(self):
+    def test_cache_read_billed_at_calibrated_rate(self):
+        # Calibrated read multiplier (~0.1054) fit to live ground truth, not the
+        # nominal 0.1 -- see _usage._CACHE_READ_MULT.
         cost = cost_for_usage("claude-opus-4-8", {"cache_read_input_tokens": 1_000_000})
-        assert cost == 0.5  # 5.0 * 0.1
+        assert cost == 5.0 * 0.10543
 
     def test_cache_creation_split_5m_1h(self):
         cost = cost_for_usage(
@@ -51,14 +53,46 @@ class TestCostForUsage:
                 }
             },
         )
-        # 5m at 1.25x (6.25) + 1h at 2x (10.0)
-        assert cost == 6.25 + 10.0
+        # Both buckets use the calibrated write multiplier (~1.3215).
+        assert cost == 5.0 * 1.32145 + 5.0 * 1.32145
 
-    def test_flat_cache_creation_billed_at_5m_rate(self):
+    def test_flat_cache_creation_billed_at_write_rate(self):
         cost = cost_for_usage(
             "claude-opus-4-8", {"cache_creation_input_tokens": 1_000_000}
         )
-        assert cost == 6.25
+        assert cost == 5.0 * 1.32145
+
+    def test_reproduces_live_ground_truth(self):
+        """The calibrated multipliers reproduce real stream-json totals.
+
+        Four single-API-call ResultMessage points captured live from the old
+        stream-json transport (claude-opus-4-8, acceptEdits). cost_for_usage on
+        each message's usage must match total_cost_usd within a tight tolerance.
+        """
+        points = [
+            # input, output, cache_read, cache_creation_1h, real_total_cost_usd
+            (1893, 4, 15914, 207, 0.01932175),
+            (1893, 10, 15914, 224, 0.019577),
+            (1893, 5, 15914, 208, 0.019364),
+            (1893, 4, 15914, 11423, 0.09342875),
+        ]
+        for inp, out, cr, cc, real in points:
+            usage = {
+                "input_tokens": inp,
+                "output_tokens": out,
+                "cache_read_input_tokens": cr,
+                "cache_creation_input_tokens": cc,
+                "cache_creation": {
+                    "ephemeral_1h_input_tokens": cc,
+                    "ephemeral_5m_input_tokens": 0,
+                },
+            }
+            computed = cost_for_usage("claude-opus-4-8", usage)
+            assert computed is not None
+            # Within 0.1% of the live total.
+            assert abs(computed - real) / real < 0.001, (
+                f"cc={cc}: computed {computed} vs real {real}"
+            )
 
     def test_bool_tokens_ignored(self):
         # Guards against True being treated as 1.

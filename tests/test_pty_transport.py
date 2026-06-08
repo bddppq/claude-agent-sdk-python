@@ -1022,10 +1022,9 @@ class TestResultFidelity:
         msgs = anyio.run(_test)
         result = next(m for m in msgs if m["type"] == "result")
         assert result["result"] == "world"  # last assistant text
-        # num_turns counts API turns within the CLI turn (the stream-json
-        # baseline semantics): two assistant messages -> 2.
-        assert result["num_turns"] == 2
-        # usage summed across both assistant messages
+        # num_turns = tool_results + 1; no tool results here -> 1.
+        assert result["num_turns"] == 1
+        # usage summed across both (anonymous, distinct) assistant messages
         assert result["usage"]["input_tokens"] == 15
         assert result["usage"]["output_tokens"] == 5
         assert result["is_error"] is False
@@ -1125,12 +1124,17 @@ class TestResultFidelity:
             return _drain(t)
 
         msgs = anyio.run(_test)
+        # Only ONE assistant message must be emitted despite the duplicate
+        # snapshot (same message.id, distinct uuid).
+        assert sum(1 for m in msgs if m["type"] == "assistant") == 1
         result = next(m for m in msgs if m["type"] == "result")
         # cost computed from usage x opus pricing; dedup keeps it at 5.0 not 10.0
         assert result["total_cost_usd"] == 5.0
         assert result["usage"]["input_tokens"] == 1_000_000
         assert result["stop_reason"] == "end_turn"
-        assert result["num_turns"] == 5
+        # num_turns = tool_results + 1; the snapshot's messageCount (5) is
+        # deliberately ignored.
+        assert result["num_turns"] == 1
         assert result["model_usage"]["claude-opus-4-8"]["cost_usd"] == 5.0
         # permission_denials is always a list (never None), like stream-json.
         assert result["permission_denials"] == []
@@ -1280,35 +1284,64 @@ class TestResultFidelity:
         result = next(m for m in msgs if m["type"] == "result")
         assert "structured_output" not in result
 
-    def test_num_turns_uses_cli_message_count(self, tmp_path):
-        # The CLI records messageCount on turn_duration; num_turns mirrors it
-        # (stream-json counts API turns, not cumulative user prompts). Each turn
-        # is independent: num_turns resets between turns.
+    def test_num_turns_counts_tool_results_plus_one(self, tmp_path):
+        # num_turns = (tool_result user records) + 1 -- each tool result is one
+        # API round-trip back to the model, plus the final answer turn. The
+        # turn_duration record's messageCount counts streamed snapshots, NOT API
+        # turns, so it must NOT drive num_turns. Verified against live
+        # stream-json num_turns. Each turn is independent: counters reset.
         async def _test():
             t = make_transport()
             path = tmp_path / "s.jsonl"
 
-            def turn(n, message_count):
-                return [
-                    {
-                        "type": "assistant",
-                        "sessionId": "s",
-                        "uuid": f"a{n}",
-                        "message": {
-                            "role": "assistant",
-                            "model": "m",
-                            "content": [{"type": "text", "text": f"r{n}"}],
-                        },
+            def assistant(n, tag):
+                return {
+                    "type": "assistant",
+                    "sessionId": "s",
+                    "uuid": f"a{n}{tag}",
+                    "message": {
+                        "role": "assistant",
+                        "id": f"msg_{n}{tag}",
+                        "model": "m",
+                        "content": [{"type": "text", "text": f"r{n}"}],
                     },
-                    {
-                        "type": "system",
-                        "subtype": "turn_duration",
-                        "uuid": f"s{n}",
-                        "messageCount": message_count,
-                    },
-                ]
+                }
 
-            lines = turn(1, 3) + turn(2, 7)
+            def tool_result(n, tag):
+                return {
+                    "type": "user",
+                    "sessionId": "s",
+                    "uuid": f"u{n}{tag}",
+                    "message": {
+                        "role": "user",
+                        "content": [{"type": "tool_result", "tool_use_id": f"t{tag}"}],
+                    },
+                }
+
+            def end(n):
+                return {
+                    "type": "system",
+                    "subtype": "turn_duration",
+                    "uuid": f"s{n}",
+                    # Deliberately a misleading large value: must be ignored.
+                    "messageCount": 99,
+                }
+
+            # Turn 1: one tool round-trip -> num_turns 2.
+            # Turn 2: three tool round-trips -> num_turns 4.
+            lines = [
+                assistant(1, "a"),
+                tool_result(1, "a"),
+                assistant(1, "b"),
+                end(1),
+            ] + [
+                assistant(2, "a"),
+                tool_result(2, "a"),
+                tool_result(2, "b"),
+                tool_result(2, "c"),
+                assistant(2, "b"),
+                end(2),
+            ]
             path.write_text("\n".join(json.dumps(x) for x in lines) + "\n")
             t._transcript_path = path
             t._out_send, t._out_recv = anyio.create_memory_object_stream(100)
@@ -1318,8 +1351,7 @@ class TestResultFidelity:
 
         msgs = anyio.run(_test)
         results = [m for m in msgs if m["type"] == "result"]
-        # Each result uses that turn's own messageCount.
-        assert [r["num_turns"] for r in results] == [3, 7]
+        assert [r["num_turns"] for r in results] == [2, 4]
 
 
 # --------------------------------------------------------------------------- #
