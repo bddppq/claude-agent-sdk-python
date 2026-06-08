@@ -1273,8 +1273,9 @@ class PtyCLITransport(Transport):
            allow_once via :func:`choose_option`).
         2. The requested update is genuinely SESSION-BROAD, i.e. it would not be
            surprising for the user to see "all edits this session" granted:
-             - any ``setMode`` update (changes the session permission mode --
-               inherently session-wide and broad), OR
+             - a ``setMode`` update to a BROADENING mode (``acceptEdits`` /
+               ``bypassPermissions``) -- a narrowing ``plan``/``default`` mode
+               must NOT trigger the session accept-edits press, OR
              - an ``addRules``/``replaceRules`` *allow* update scoped to the
                ``"session"`` destination whose rules are tool-category-broad
                (no narrowing ``rule_content``).
@@ -1292,9 +1293,15 @@ class PtyCLITransport(Transport):
         if not has_persist_option:
             return False
         for upd in updated_permissions:
-            # setMode is inherently a session-wide, broad change of posture.
+            # setMode maps onto the TUI's "allow all edits this session" press
+            # ONLY when it BROADENS posture (acceptEdits / bypassPermissions).
+            # A narrowing/re-tightening mode (plan / default) -- or any other
+            # value -- must NOT trigger a session-wide accept-edits grant, which
+            # would be strictly broader than requested; fall back to allow_once.
             if upd.type == "setMode":
-                return True
+                if upd.mode in ("acceptEdits", "bypassPermissions"):
+                    return True
+                continue
             if upd.type in ("addRules", "replaceRules"):
                 # Only an *allow* rule maps onto an allow-persist press. deny/ask
                 # cannot be expressed by pressing "allow all".

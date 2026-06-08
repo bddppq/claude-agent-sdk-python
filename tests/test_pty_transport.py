@@ -1089,9 +1089,19 @@ class TestPersistAllowRL12:
         assert PtyCLITransport._should_persist_allow(q, []) is False
 
     def test_setmode_is_session_broad(self):
+        # Only BROADENING modes map onto the session accept-edits press.
         q = self._question()
-        upd = [self._upd(type="setMode", mode="acceptEdits")]
-        assert PtyCLITransport._should_persist_allow(q, upd) is True
+        for mode in ("acceptEdits", "bypassPermissions"):
+            upd = [self._upd(type="setMode", mode=mode)]
+            assert PtyCLITransport._should_persist_allow(q, upd) is True
+
+    def test_setmode_narrowing_mode_does_not_overgrant(self):
+        # plan/default re-tighten posture; pressing "allow all edits this
+        # session" would grant strictly BROADER than requested (RL13).
+        q = self._question()
+        for mode in ("plan", "default", None):
+            upd = [self._upd(type="setMode", mode=mode)]
+            assert PtyCLITransport._should_persist_allow(q, upd) is False
 
     def test_broad_session_allow_rule_persists(self):
         q = self._question()
