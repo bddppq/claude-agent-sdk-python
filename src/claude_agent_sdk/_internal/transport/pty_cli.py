@@ -1255,6 +1255,54 @@ class PtyCLITransport(Transport):
         return "allow"
 
     @staticmethod
+    def _is_session_broad(upd: PermissionUpdate) -> bool:
+        """Is a SINGLE :class:`PermissionUpdate` at-least-as-broad as the TUI's
+        "allow all edits this session" grant? (RL15 helper.)
+
+        STRICT POSITIVE ALLOWLIST -- default ``False``. Returns ``True`` ONLY for:
+          (a) a ``setMode`` update to a BROADENING mode
+              (``acceptEdits`` / ``bypassPermissions``); a narrowing/re-tightening
+              ``plan``/``default`` mode, or any other / ``None`` value -> ``False``.
+          (b) an ``addRules``/``replaceRules`` update with an explicit
+              ``behavior == "allow"``, a ``destination`` in ``{None, "session"}``
+              (disk destinations the TUI session press cannot express -> ``False``),
+              a NON-EMPTY rule list (a no-op grant of zero rules is not broad), and
+              NO narrowing ``rule_content`` on any rule (a path glob is finer than
+              "all edits this session").
+        Everything else (deny/ask/None behavior, narrowing rule_content, disk
+        destination, empty/None rules, addDirectories/removeDirectories/
+        removeRules, any unknown/None type) -> ``False``.
+        """
+        # (a) setMode -- only the broadening modes map onto "allow all edits
+        # this session". plan/default/None/other are narrowing or non-broad.
+        if upd.type == "setMode":
+            return upd.mode in ("acceptEdits", "bypassPermissions")
+        # (b) addRules/replaceRules -- session-broad ONLY when ALL hold.
+        if upd.type in ("addRules", "replaceRules"):
+            # behavior must be an explicit "allow" (deny/ask, and an absent
+            # behavior, cannot be expressed by pressing "allow all").
+            if upd.behavior != "allow":
+                return False
+            # destination must be the session (the only scope the TUI's
+            # session-allow option honors); disk destinations or any unknown
+            # value would over-claim what the keystroke actually does. A None
+            # destination defaults to session, so it is accepted.
+            if upd.destination not in (None, "session"):
+                return False
+            # rules must be NON-EMPTY: an update granting zero rules (rules=[]
+            # or None) is a no-op, not session-broad.
+            rules = upd.rules or []
+            if not rules:
+                return False
+            # rules must be tool-category broad: any narrowing rule_content
+            # (e.g. a path glob) is finer than "all edits this session".
+            return not any(r.rule_content for r in rules)
+        # Everything else (addDirectories/removeDirectories/removeRules and any
+        # unknown/None type) does NOT correspond to the "allow all edits this
+        # session" press.
+        return False
+
+    @staticmethod
     def _should_persist_allow(
         question: DetectedQuestion,
         updated_permissions: list[PermissionUpdate] | None,
@@ -1303,47 +1351,18 @@ class PtyCLITransport(Transport):
         has_persist_option = any(o.action == "allow_persist" for o in question.options)
         if not has_persist_option:
             return False
-        for upd in updated_permissions:
-            # (a) setMode maps onto the TUI's "allow all edits this session"
-            # press ONLY when it BROADENS posture (acceptEdits /
-            # bypassPermissions). A narrowing/re-tightening mode (plan / default)
-            # or any other / None value must NOT trigger a session-wide
-            # accept-edits grant (strictly broader than requested) -- fall
-            # through to allow_once.
-            if upd.type == "setMode":
-                if upd.mode in ("acceptEdits", "bypassPermissions"):
-                    return True
-                continue
-            # (b) addRules/replaceRules -> allow_persist ONLY when the update is
-            # affirmatively session-broad. ALL of the following must hold; any
-            # miss -> continue (allow_once):
-            if upd.type in ("addRules", "replaceRules"):
-                # behavior must be an explicit "allow" (deny/ask, and an absent
-                # behavior, cannot be expressed by pressing "allow all").
-                if upd.behavior != "allow":
-                    continue
-                # destination must be the session (the only scope the TUI's
-                # session-allow option honors); disk destinations or any unknown
-                # value would over-claim what the keystroke actually does. A
-                # None destination defaults to session, so it is accepted.
-                if upd.destination not in (None, "session"):
-                    continue
-                # rules must be NON-EMPTY: an update granting zero rules
-                # (rules=[] or None) is a no-op, not session-broad, and must not
-                # press the broadest allow.
-                rules = upd.rules or []
-                if not rules:
-                    continue
-                # rules must be tool-category broad: any narrowing rule_content
-                # (e.g. a path glob) is finer than "all edits this session", so
-                # pressing persist would over-grant.
-                if any(r.rule_content for r in rules):
-                    continue
-                return True
-            # Everything else (addDirectories/removeDirectories/removeRules and
-            # any unknown/None type) does NOT correspond to the "allow all edits
-            # this session" press -- fall through to allow_once.
-        return False
+        # UNANIMITY (RL15): press allow_persist ONLY when EVERY element of the
+        # requested update is itself session-broad. A multi-element list whose
+        # COMBINED intent is narrower -- e.g. a broadening setMode paired with a
+        # later deny/narrowing rule, or a broad allow followed by a path-scoped
+        # rule -- must NOT short-circuit to the broadest "allow all edits this
+        # session" press, dropping the narrowing elements. If ANY element is not
+        # session-broad we fall back to allow_once (apply this call faithfully;
+        # the narrower combined rule simply cannot be expressed via the coarse
+        # TUI affordance).
+        return all(
+            PtyCLITransport._is_session_broad(upd) for upd in updated_permissions
+        )
 
     async def _await_recovered_tool_input(
         self, tool_name: str, timeout_s: float = 2.0, poll_s: float = 0.02

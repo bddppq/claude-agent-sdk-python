@@ -1203,6 +1203,93 @@ class TestPersistAllowRL12:
         upd = [self._upd(type="setMode", mode="acceptEdits")]
         assert PtyCLITransport._should_persist_allow(q, upd) is False
 
+    # --- RL15: multi-element list unanimity ------------------------------- #
+
+    def test_mixed_broad_and_narrowing_list_does_not_overgrant(self):
+        # RL15: a list whose COMBINED intent is narrower than a blanket session
+        # accept-edits must NOT short-circuit to allow_persist on the FIRST
+        # broad element -- the later narrowing element(s) would be dropped.
+        q = self._question()
+        broad_mode = self._upd(type="setMode", mode="acceptEdits")
+        deny_rule = self._upd(
+            type="addRules",
+            behavior="deny",
+            destination="session",
+            rules=[self._rule("Bash", rule_content="rm -rf /")],
+        )
+        broad_allow = self._upd(
+            type="addRules",
+            behavior="allow",
+            destination="session",
+            rules=[self._rule("Write")],
+        )
+        narrow_allow = self._upd(
+            type="addRules",
+            behavior="allow",
+            destination="session",
+            rules=[self._rule("Write", rule_content="/tmp/**")],
+        )
+        plan_mode = self._upd(type="setMode", mode="plan")
+        cases = [
+            # broad setMode + a deny rule -> deny constraint must not be dropped.
+            [broad_mode, deny_rule],
+            # broad allow rule + a path-scoped narrowing allow -> narrowing kept.
+            [broad_allow, narrow_allow],
+            # acceptEdits + a re-tighten to plan -> not unanimously broad.
+            [broad_mode, plan_mode],
+            # order-independence: narrow-first still must not over-grant.
+            [deny_rule, broad_mode],
+            [narrow_allow, broad_allow],
+        ]
+        for upd in cases:
+            assert PtyCLITransport._should_persist_allow(q, upd) is False
+
+    def test_unanimous_broad_list_persists(self):
+        # RL15 positive path: EVERY element session-broad -> persist.
+        q = self._question()
+        upd = [
+            self._upd(type="setMode", mode="acceptEdits"),
+            self._upd(
+                type="addRules",
+                behavior="allow",
+                destination="session",
+                rules=[self._rule("Write")],
+            ),
+        ]
+        assert PtyCLITransport._should_persist_allow(q, upd) is True
+        # Two broad session allows -> still unanimous.
+        upd2 = [
+            self._upd(
+                type="addRules",
+                behavior="allow",
+                destination="session",
+                rules=[self._rule("Write")],
+            ),
+            self._upd(
+                type="addRules",
+                behavior="allow",
+                destination=None,
+                rules=[self._rule("Edit")],
+            ),
+        ]
+        assert PtyCLITransport._should_persist_allow(q, upd2) is True
+        # Two broadening setModes (acceptEdits + bypassPermissions).
+        upd3 = [
+            self._upd(type="setMode", mode="acceptEdits"),
+            self._upd(type="setMode", mode="bypassPermissions"),
+        ]
+        assert PtyCLITransport._should_persist_allow(q, upd3) is True
+
+    def test_setmode_acceptedits_then_plan_does_not_overgrant(self):
+        # Explicit RL15 review case: [setMode acceptEdits, setMode plan] -> the
+        # re-tighten to plan must NOT be dropped.
+        q = self._question()
+        upd = [
+            self._upd(type="setMode", mode="acceptEdits"),
+            self._upd(type="setMode", mode="plan"),
+        ]
+        assert PtyCLITransport._should_persist_allow(q, upd) is False
+
     # --- _decide_permission integration ----------------------------------- #
 
     def test_decide_persist_when_session_broad(self):
