@@ -275,6 +275,11 @@ class PtyCLITransport(Transport):
         self._proc: Popen[bytes] | None = None
         self._master_fd: int | None = None
         self._transcript_path: Path | None = None
+        # Byte offset to start tailing at. For a brand-new session this is 0; for
+        # a --resume/--continue against an existing transcript it is the file's
+        # size at spawn, so the pre-existing prior turn's records (especially the
+        # old turn_duration) are NOT replayed as the current turn's result (RW3).
+        self._initial_tail_offset = 0
 
         self._out_send: Any = None
         self._out_recv: Any = None
@@ -446,6 +451,17 @@ class PtyCLITransport(Transport):
         _ACTIVE_CHILDREN.add(self)
 
         self._transcript_path = self._compute_transcript_path()
+
+        # When resuming/continuing an existing transcript, start tailing past the
+        # records already on disk so the prior turn's trailing turn_duration is
+        # not replayed as a stale result for the NEW turn (RW3). For a brand-new
+        # session the file does not exist yet, so the offset stays 0.
+        if self._options.resume or self._options.continue_conversation:
+            resume_path = self._resume_transcript_path()
+            if resume_path is not None:
+                self._transcript_path = resume_path
+                with contextlib.suppress(OSError):
+                    self._initial_tail_offset = resume_path.stat().st_size
 
         # Honor options.max_buffer_size for the message buffer (M8). It bounded a
         # byte pipe in the old transport; here it bounds the count of buffered
@@ -719,7 +735,52 @@ class PtyCLITransport(Transport):
         project_dir = _get_projects_dir(
             env_override=self._options.env
         ) / _sanitize_path(_canonicalize_path(self._cwd))
-        return project_dir / f"{self._session_id}.jsonl"
+        # The CLI writes/extends the transcript under the id it actually uses.
+        # For an explicit/auto session id that is ``self._session_id``; for a
+        # --resume (without an explicit session id) the CLI appends to the
+        # resumed transcript ``<resume>.jsonl``, so we must tail THAT file, not a
+        # fresh id, or resume context is lost (RW3).
+        transcript_id = self._session_id
+        if self._options.resume and not self._options.session_id:
+            transcript_id = self._options.resume
+        return project_dir / f"{transcript_id}.jsonl"
+
+    def _resume_transcript_path(self) -> Path | None:
+        """Resolve the EXISTING transcript a --resume/--continue targets (RW3).
+
+        Returns the file the CLI will append the resumed turn to, so we can seed
+        the tail offset past the pre-existing records. Returns ``None`` if no
+        such file exists yet (then the offset stays 0 and the normal resolution
+        path applies).
+
+        * ``--resume <id>`` (no explicit session id): ``<id>.jsonl`` -- the id is
+          known deterministically.
+        * ``--continue``: the CLI continues the most recently modified session in
+          the cwd's project dir, so pick the newest pre-existing ``*.jsonl``.
+        """
+        o = self._options
+        if o.session_id:
+            # Caller pinned the id; the CLI writes/extends <session_id>.jsonl.
+            candidate = self._compute_transcript_path()
+            return candidate if candidate.exists() else None
+        if o.resume:
+            candidate = self._compute_transcript_path()
+            return candidate if candidate.exists() else None
+        if o.continue_conversation:
+            project_dir = (
+                self._transcript_path.parent if self._transcript_path else None
+            )
+            if project_dir is None or not project_dir.is_dir():
+                return None
+            newest: Path | None = None
+            newest_mtime = -1.0
+            with contextlib.suppress(OSError):
+                for p in project_dir.glob("*.jsonl"):
+                    mtime = p.stat().st_mtime
+                    if mtime > newest_mtime:
+                        newest, newest_mtime = p, mtime
+            return newest
+        return None
 
     def _resolve_transcript_path(self) -> Path | None:
         """Locate the transcript the CLI is actually writing, or ``None``.
@@ -941,7 +1002,9 @@ class PtyCLITransport(Transport):
     async def _tail_loop(self) -> None:
         """Tail the transcript file and translate new records into messages."""
         path: Path | None = None
-        offset = 0
+        # Skip pre-existing records when resuming an existing transcript (RW3);
+        # 0 for a brand-new session.
+        offset = self._initial_tail_offset
         buffer = b""
         try:
             while not self._closed:
@@ -1350,6 +1413,15 @@ class PtyCLITransport(Transport):
         """
         if self._result_emitted:
             return
+        # An interrupt while no turn is in flight is a no-op (RW2). Without this
+        # guard an idle interrupt() synthesizes a spurious error_during_execution
+        # result into the buffer, which the NEXT real turn's receive_response()
+        # reads first and returns immediately -- corrupting that turn. The
+        # baseline treats an idle interrupt as harmless. ``_turn_start_time`` is
+        # set in ``_type_prompt`` for the duration of an active turn and cleared
+        # by ``_reset_turn_state``, so it is the "no active turn" sentinel.
+        if self._turn_start_time is None:
+            return
         self._turn_count += 1
         duration = 0
         if self._turn_start_time is not None:
@@ -1681,6 +1753,47 @@ class PtyCLITransport(Transport):
             text = ""
         if text.strip():
             await self._type_prompt(text)
+        else:
+            # Empty / whitespace-only prompt (RW1). A truly empty turn cannot be
+            # submitted over the TUI (bracketed-paste of "" + Enter is a no-op),
+            # so no transcript record or turn_duration is ever written and
+            # receive_response() would hang forever. The baseline returns a
+            # terminating ResultMessage for an empty prompt, so we synthesize one
+            # (mirroring the deny/interrupt synthesis) rather than dropping the
+            # turn -- the documented contract is that receive_response() always
+            # terminates.
+            await self._emit_empty_prompt_result()
+
+    async def _emit_empty_prompt_result(self) -> None:
+        """Synthesize a terminating result for an empty/whitespace prompt (RW1).
+
+        The TUI cannot submit an empty turn, so the CLI never runs one and never
+        writes a result. The stream-json baseline returned ``subtype=success``
+        for an empty prompt, so we mirror that subtype/fields here so
+        ``receive_response()`` terminates instead of deadlocking.
+        """
+        # Per-turn init still leads every turn after the first, matching the
+        # baseline ordering (RR4).
+        if self._submitted_turns > 0:
+            await self._emit_init_message()
+        self._submitted_turns += 1
+        self._turn_count += 1
+        result: dict[str, Any] = {
+            "type": "result",
+            "subtype": "success",
+            "duration_ms": 0,
+            "duration_api_ms": 0,
+            "is_error": False,
+            "num_turns": 1,
+            "session_id": self._observed_session_id or self._session_id,
+            "result": "",
+            "stop_reason": None,
+            "uuid": str(uuid.uuid4()),
+        }
+        result["permission_denials"] = list(self._turn_permission_denials)
+        self._result_emitted = True
+        await self._send(result)
+        self._reset_turn_state()
 
     async def _emit_init_message(self) -> None:
         """Emit a fresh ``system/init`` message (RR4).

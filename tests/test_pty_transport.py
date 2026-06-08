@@ -1947,6 +1947,247 @@ class TestInterruptResult:
         msgs = anyio.run(_test)
         assert not any(m["type"] == "result" for m in msgs)
 
+    def test_idle_interrupt_is_noop_and_does_not_poison_next_turn(self):
+        """RW2: interrupt() with no turn in flight must NOT synthesize a result.
+
+        Otherwise the spurious error_during_execution sits in the buffer and the
+        NEXT real turn's receive_response() returns it first -- corrupting that
+        turn. The baseline treats an idle interrupt as harmless.
+        """
+
+        async def _test():
+            t = make_transport()
+            t._out_send, t._out_recv = anyio.create_memory_object_stream(100)
+            t._result_emitted = False
+            t._turn_start_time = None  # no active turn
+            with patch.object(t, "_pty_write", new=_noop_async):
+                await t._handle_control_request(
+                    {
+                        "type": "control_request",
+                        "request_id": "r",
+                        "request": {"subtype": "interrupt"},
+                    }
+                )
+            return _drain(t)
+
+        msgs = anyio.run(_test)
+        # The ACK still goes out, but NO stale result is buffered.
+        assert any(m["type"] == "control_response" for m in msgs)
+        assert not any(m["type"] == "result" for m in msgs)
+
+
+# --------------------------------------------------------------------------- #
+# RW1: empty / whitespace-only prompt terminates instead of hanging
+# --------------------------------------------------------------------------- #
+
+
+class TestEmptyPromptResult:
+    @pytest.mark.parametrize("prompt", ["", "   ", "\n\t  "])
+    def test_empty_prompt_synthesizes_terminating_result(self, prompt):
+        """RW1: an empty/whitespace prompt cannot be submitted to the TUI, so we
+        synthesize a terminating success result (matching the baseline subtype)
+        rather than letting receive_response() hang forever."""
+
+        async def _test():
+            from unittest.mock import AsyncMock
+
+            t = make_transport()
+            t._ready = True
+            t._out_send, t._out_recv = anyio.create_memory_object_stream(100)
+            typed = AsyncMock()
+            with (
+                patch.object(t, "_warmup", new=_noop_async),
+                patch.object(t, "_pty_write", new=_noop_async),
+                patch.object(t, "_type_prompt", new=typed),
+            ):
+                await t._handle_user_message(
+                    {"message": {"role": "user", "content": prompt}}
+                )
+            # _type_prompt must NOT be called for an empty prompt.
+            typed.assert_not_called()
+            return _drain(t)
+
+        msgs = anyio.run(_test)
+        result = next(m for m in msgs if m["type"] == "result")
+        assert result["subtype"] == "success"
+        assert result["is_error"] is False
+        assert result["permission_denials"] == []
+
+    def test_nonempty_prompt_still_typed(self):
+        async def _test():
+            from unittest.mock import AsyncMock
+
+            t = make_transport()
+            t._ready = True
+            t._out_send, t._out_recv = anyio.create_memory_object_stream(100)
+            typed = AsyncMock()
+            with patch.object(t, "_type_prompt", new=typed):
+                await t._handle_user_message(
+                    {"message": {"role": "user", "content": "hello"}}
+                )
+            typed.assert_called_once()
+            return _drain(t)
+
+        msgs = anyio.run(_test)
+        # A real turn was submitted -> no synthetic result yet.
+        assert not any(m["type"] == "result" for m in msgs)
+
+
+# --------------------------------------------------------------------------- #
+# RW3: resume/continue restores context (flag logic + tail offset)
+# --------------------------------------------------------------------------- #
+
+
+class TestResumeDropIn:
+    def test_resume_does_not_auto_append_session_id(self):
+        """RW3(1): with --resume and no caller session_id, the auto id must NOT
+        be appended (it would override the resume target), matching baseline."""
+        from claude_agent_sdk._internal.transport import _cli_command
+
+        cmd = _cli_command.build_command(
+            DEFAULT_CLI,
+            ClaudeAgentOptions(resume="old-sid"),
+            "auto-sid",
+        )
+        assert "--resume" in cmd
+        assert cmd[cmd.index("--resume") + 1] == "old-sid"
+        assert "--session-id" not in cmd
+
+    def test_continue_does_not_auto_append_session_id(self):
+        from claude_agent_sdk._internal.transport import _cli_command
+
+        cmd = _cli_command.build_command(
+            DEFAULT_CLI,
+            ClaudeAgentOptions(continue_conversation=True),
+            "auto-sid",
+        )
+        assert "--continue" in cmd
+        assert "--session-id" not in cmd
+
+    def test_explicit_session_id_wins_with_resume(self):
+        from claude_agent_sdk._internal.transport import _cli_command
+
+        cmd = _cli_command.build_command(
+            DEFAULT_CLI,
+            ClaudeAgentOptions(resume="old-sid", session_id="explicit"),
+            "auto-sid",
+        )
+        assert cmd[cmd.index("--session-id") + 1] == "explicit"
+
+    def test_new_session_still_auto_appends_session_id(self):
+        from claude_agent_sdk._internal.transport import _cli_command
+
+        cmd = _cli_command.build_command(
+            DEFAULT_CLI,
+            ClaudeAgentOptions(),
+            "auto-sid",
+        )
+        assert cmd[cmd.index("--session-id") + 1] == "auto-sid"
+
+    def test_resume_transcript_path_targets_resume_file(self):
+        t = make_transport(resume="11111111-1111-1111-1111-111111111111")
+        path = t._compute_transcript_path()
+        assert path.name == "11111111-1111-1111-1111-111111111111.jsonl"
+
+    def test_resume_tail_starts_past_preexisting_records(self, tmp_path):
+        """RW3(2): when resuming an existing transcript, the tail loop must start
+        at the file's current size so the prior turn's trailing turn_duration is
+        NOT replayed as a stale result for the new turn."""
+
+        async def _test():
+            t = make_transport(resume="sid")
+            path = tmp_path / "sid.jsonl"
+            # A pre-existing prior turn, ending with its turn_duration.
+            path.write_text(
+                "\n".join(
+                    json.dumps(line)
+                    for line in [
+                        {
+                            "type": "assistant",
+                            "sessionId": "sid",
+                            "uuid": "old1",
+                            "message": {
+                                "role": "assistant",
+                                "id": "msg_old",
+                                "model": "claude-opus-4-8",
+                                "content": [{"type": "text", "text": "DONE."}],
+                            },
+                        },
+                        {
+                            "type": "system",
+                            "subtype": "turn_duration",
+                            "sessionId": "sid",
+                            "uuid": "olddur",
+                            "durationMs": 1000,
+                        },
+                    ]
+                )
+                + "\n"
+            )
+            t._transcript_path = path
+            # Simulate connect() seeding the offset past the existing records.
+            t._initial_tail_offset = path.stat().st_size
+            t._out_send, t._out_recv = anyio.create_memory_object_stream(100)
+            t._closed = False
+            t._input_ended = True  # let the loop stop once a result is emitted
+
+            # Run the tail loop briefly; the new turn appends fresh records.
+            async def _appender():
+                with path.open("a") as f:
+                    f.write(
+                        json.dumps(
+                            {
+                                "type": "assistant",
+                                "sessionId": "sid",
+                                "uuid": "new1",
+                                "message": {
+                                    "role": "assistant",
+                                    "id": "msg_new",
+                                    "model": "claude-opus-4-8",
+                                    "content": [{"type": "text", "text": "4271"}],
+                                },
+                            }
+                        )
+                        + "\n"
+                    )
+                    f.write(
+                        json.dumps(
+                            {
+                                "type": "system",
+                                "subtype": "turn_duration",
+                                "sessionId": "sid",
+                                "uuid": "newdur",
+                                "durationMs": 500,
+                            }
+                        )
+                        + "\n"
+                    )
+
+            async with anyio.create_task_group() as tg:
+                tg.start_soon(t._tail_loop)
+                await anyio.sleep(0.15)
+                await _appender()
+                with anyio.move_on_after(3):
+                    while not t._result_emitted:
+                        await anyio.sleep(0.05)
+                t._closed = True
+            return _drain(t)
+
+        msgs = anyio.run(_test)
+        # The old turn's DONE. text and old turn_duration must NOT be replayed.
+        assert not any(
+            m.get("type") == "assistant"
+            and any(
+                b.get("text") == "DONE."
+                for b in m.get("message", {}).get("content", [])
+            )
+            for m in msgs
+        )
+        # Exactly one result, and it carries the NEW turn's text.
+        results = [m for m in msgs if m.get("type") == "result"]
+        assert len(results) == 1
+        assert results[0]["result"] == "4271"
+
 
 async def _noop_async(*_args, **_kwargs):
     return None

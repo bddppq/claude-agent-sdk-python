@@ -165,8 +165,11 @@ def build_command(
 ) -> list[str]:
     """Build the interactive CLI command from ``options``.
 
-    ``session_id`` is always passed via ``--session-id`` so the transport can
-    locate the transcript file the CLI writes.
+    ``session_id`` (the transport's auto-generated id) is passed via
+    ``--session-id`` ONLY for a brand-new session so the transport can locate the
+    transcript file the CLI writes. When resuming/continuing it is NOT appended
+    (it would override the resume target), matching the baseline; the caller's
+    explicit ``options.session_id`` always wins.
     """
     cmd = [cli_path]
 
@@ -234,8 +237,21 @@ def build_command(
     if options.resume:
         cmd.extend(["--resume", options.resume])
 
-    # Always pass a session id so the transcript file can be located.
-    cmd.extend(["--session-id", options.session_id or session_id])
+    # Session id handling (RW3). The baseline only ever passes --session-id when
+    # the CALLER set options.session_id (subprocess_cli.py:294). Auto-appending a
+    # fresh --session-id alongside --resume/--continue makes the CLI append to
+    # the RESUMED session while the transport tails a different/nonexistent path,
+    # so resume silently loses context. We therefore:
+    #   * never auto-append --session-id when --resume/--continue is set (unless
+    #     the caller explicitly set one) -- the transcript is then located from
+    #     the resume id;
+    #   * still auto-append an id for a brand-new session, because (unlike the
+    #     stdout-reading baseline) the PTY must KNOW the transcript filename to
+    #     tail it, and the CLI would otherwise pick an id we cannot observe.
+    if options.session_id:
+        cmd.extend(["--session-id", options.session_id])
+    elif not (options.resume or options.continue_conversation):
+        cmd.extend(["--session-id", session_id])
 
     settings_value = build_settings_value(options)
     if settings_value:
