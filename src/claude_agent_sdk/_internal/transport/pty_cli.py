@@ -1282,10 +1282,21 @@ class PtyCLITransport(Transport):
 
         A narrow rule (``rule_content`` set), a non-session destination
         (userSettings/projectSettings/localSettings -- the TUI session option
-        cannot express persistence to disk), a deny/ask behavior, or an empty
-        list all fail the test, so we fall back to one-shot allow rather than
-        silently granting broader-than-requested. The exact persisted rule then
-        simply cannot be expressed via the TUI; we apply this call faithfully.
+        cannot express persistence to disk), a deny/ask behavior, an EMPTY/None
+        rule list (a no-op grant of zero rules cannot justify the broadest
+        session press), or any other update shape all fail the test, so we fall
+        back to one-shot allow rather than silently granting broader-than-
+        requested. The exact persisted rule then simply cannot be expressed via
+        the TUI; we apply this call faithfully.
+
+        This is a STRICT POSITIVE ALLOWLIST: the default is to NOT persist.
+        ``True`` is returned ONLY for an update shape that is affirmatively
+        at-least-as-broad as the TUI's "allow all edits this session" grant.
+        Every other shape -- other update types, narrowing/unknown/None modes,
+        deny/ask behavior, disk destinations, empty/None rules, narrowing
+        ``rule_content`` -- falls through to ``False`` (allow_once). The
+        function must NEVER press allow_persist for anything narrower than the
+        session grant.
         """
         if not updated_permissions:
             return False
@@ -1293,34 +1304,45 @@ class PtyCLITransport(Transport):
         if not has_persist_option:
             return False
         for upd in updated_permissions:
-            # setMode maps onto the TUI's "allow all edits this session" press
-            # ONLY when it BROADENS posture (acceptEdits / bypassPermissions).
-            # A narrowing/re-tightening mode (plan / default) -- or any other
-            # value -- must NOT trigger a session-wide accept-edits grant, which
-            # would be strictly broader than requested; fall back to allow_once.
+            # (a) setMode maps onto the TUI's "allow all edits this session"
+            # press ONLY when it BROADENS posture (acceptEdits /
+            # bypassPermissions). A narrowing/re-tightening mode (plan / default)
+            # or any other / None value must NOT trigger a session-wide
+            # accept-edits grant (strictly broader than requested) -- fall
+            # through to allow_once.
             if upd.type == "setMode":
                 if upd.mode in ("acceptEdits", "bypassPermissions"):
                     return True
                 continue
+            # (b) addRules/replaceRules -> allow_persist ONLY when the update is
+            # affirmatively session-broad. ALL of the following must hold; any
+            # miss -> continue (allow_once):
             if upd.type in ("addRules", "replaceRules"):
-                # Only an *allow* rule maps onto an allow-persist press. deny/ask
-                # cannot be expressed by pressing "allow all".
-                if upd.behavior is not None and upd.behavior != "allow":
+                # behavior must be an explicit "allow" (deny/ask, and an absent
+                # behavior, cannot be expressed by pressing "allow all").
+                if upd.behavior != "allow":
                     continue
-                # Must be scoped to the session (the only thing the TUI's
-                # session-allow option can honor); disk-scoped destinations
-                # would over-claim what the keystroke actually does.
+                # destination must be the session (the only scope the TUI's
+                # session-allow option honors); disk destinations or any unknown
+                # value would over-claim what the keystroke actually does. A
+                # None destination defaults to session, so it is accepted.
                 if upd.destination not in (None, "session"):
                     continue
-                # Tool-category broad: a narrowing rule_content (e.g. a path
-                # glob) is finer than the TUI's "all edits this session", so
-                # pressing persist would over-grant -- skip it.
+                # rules must be NON-EMPTY: an update granting zero rules
+                # (rules=[] or None) is a no-op, not session-broad, and must not
+                # press the broadest allow.
                 rules = upd.rules or []
+                if not rules:
+                    continue
+                # rules must be tool-category broad: any narrowing rule_content
+                # (e.g. a path glob) is finer than "all edits this session", so
+                # pressing persist would over-grant.
                 if any(r.rule_content for r in rules):
                     continue
                 return True
-            # addDirectories/removeDirectories/removeRules don't correspond to
-            # the "allow all edits this session" press; ignore them.
+            # Everything else (addDirectories/removeDirectories/removeRules and
+            # any unknown/None type) does NOT correspond to the "allow all edits
+            # this session" press -- fall through to allow_once.
         return False
 
     async def _await_recovered_tool_input(

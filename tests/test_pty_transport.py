@@ -1154,6 +1154,48 @@ class TestPersistAllowRL12:
         ]
         assert PtyCLITransport._should_persist_allow(q, upd) is False
 
+    def test_empty_rules_addrule_does_not_overgrant(self):
+        # RL14: an addRules/replaceRules *allow* update scoped to session/None
+        # but granting ZERO rules (rules=[] or rules=None) is a no-op, not
+        # session-broad; pressing "allow all edits this session" would
+        # over-grant. Must fall back to allow_once.
+        q = self._question()
+        for upd_type in ("addRules", "replaceRules"):
+            for rules in ([], None):
+                for dest in ("session", None):
+                    upd = [
+                        self._upd(
+                            type=upd_type,
+                            behavior="allow",
+                            destination=dest,
+                            rules=rules,
+                        )
+                    ]
+                    assert PtyCLITransport._should_persist_allow(q, upd) is False
+
+    def test_none_behavior_rule_does_not_persist(self):
+        # RL14 hardening: a strict positive allowlist requires an affirmative
+        # behavior=="allow"; an absent (None) behavior is not affirmatively
+        # allow -> do not persist.
+        q = self._question()
+        upd = [
+            self._upd(
+                type="addRules",
+                behavior=None,
+                destination="session",
+                rules=[self._rule("Write")],
+            )
+        ]
+        assert PtyCLITransport._should_persist_allow(q, upd) is False
+
+    def test_unknown_update_type_does_not_persist(self):
+        # RL14 hardening: types with no session-allow analogue
+        # (addDirectories/removeDirectories/removeRules) fall through.
+        q = self._question()
+        for upd_type in ("addDirectories", "removeDirectories", "removeRules"):
+            upd = [self._upd(type=upd_type)]
+            assert PtyCLITransport._should_persist_allow(q, upd) is False
+
     def test_no_persist_option_in_dialog_is_false(self):
         # Bash-style dialog with no "allow all edits this session" option ->
         # nothing to press, fall back to allow_once.
