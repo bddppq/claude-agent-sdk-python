@@ -14,17 +14,27 @@ the rest of the SDK already understands (``assistant`` / ``user`` / ``result``
 
 POSIX only -- PTYs are not available on Windows.
 
-``can_use_tool`` IS supported: the interactive CLI renders tool-permission
-prompts as on-screen dialogs, which a background watcher detects (via the
-``pty_question`` screen parser) and answers by keystroke -- routing the decision
-through the ``can_use_tool`` callback when provided, or a safe default otherwise
-so turns never hang on an unanswered prompt.
+``hooks`` and ``can_use_tool`` ARE supported via the settings-hook IPC bridge
+(see :mod:`._hook_ipc` / :mod:`._hook_shim`): connect() starts a localhost IPC
+server and synthesizes a ``--settings`` ``hooks`` block wiring the relevant hook
+events to a tiny shim command. The CLI runs the shim, which forwards the
+hook-event JSON to the SDK, which dispatches to the user's programmatic
+``options.hooks`` callbacks and -- for ``PreToolUse`` when ``can_use_tool`` is
+set -- routes the tool permission through it DETERMINISTICALLY (the hook's
+``permissionDecision``/``updatedInput`` short-circuits the CLI's permission
+flow, so ``PermissionResultAllow(updated_input=...)`` actually changes the
+executed tool input -- something the TUI dialog cannot express). If the bridge
+cannot start, the transport falls back to the screen-scrape watcher: the
+interactive CLI renders tool-permission prompts as on-screen dialogs, which a
+background watcher detects (via the ``pty_question`` screen parser) and answers
+by keystroke, routing through ``can_use_tool`` when provided or a safe default
+otherwise so turns never hang. The watcher always handles plan-approval /
+AskUserQuestion / app dialogs (those are not PreToolUse hooks).
 
 Unsupported options (interactive mode has no equivalent SDK channel). These are
 rejected up front by :meth:`PtyCLITransport._validate_options` with an
 actionable error rather than failing silently or hanging:
 
-* ``hooks`` -- programmatic hook callbacks require the bidirectional protocol;
 * in-process ``mcp_servers`` of ``type="sdk"`` -- reachable only over the
   control protocol (external stdio/http/sse MCP servers still work);
 * ``session_store`` -- relied on ``transcript_mirror`` stdout frames;
