@@ -95,10 +95,13 @@ class TestBuildHooksSettings:
         assert list(block) == ["PreToolUse"]
         assert "matcher" not in block["PreToolUse"][0]
 
-    async def test_can_use_tool_reuses_existing_pretooluse_entry(self):
-        # If the user configured PreToolUse hooks, the shim is already wired for
-        # that event (one shim call dispatches BOTH user hooks AND can_use_tool),
-        # so no extra catch-all entry is added.
+    async def test_can_use_tool_with_narrow_matcher_still_adds_catchall(self):
+        # W2 (permission bypass): when can_use_tool is set AND the user has a
+        # NARROW PreToolUse matcher (e.g. "Write"), build_hooks_settings MUST
+        # still emit a catch-all (no-matcher) PreToolUse entry, so the shim runs
+        # for EVERY tool and can_use_tool is consulted for tools the user matcher
+        # does not cover (Bash/Edit/...). Otherwise those tools are silently
+        # auto-allowed.
         async def _h(inp, tuid, ctx):  # noqa: ANN001, ANN202
             return {}
 
@@ -110,8 +113,30 @@ class TestBuildHooksSettings:
             can_use_tool=_can_use,
         )
         block = build_hooks_settings(server)
-        assert len(block["PreToolUse"]) == 1
-        assert block["PreToolUse"][0]["matcher"] == "Write"
+        pre = block["PreToolUse"]
+        # The user's narrow entry is preserved AND a catch-all is appended.
+        assert any(e.get("matcher") == "Write" for e in pre)
+        assert any("matcher" not in e for e in pre), (
+            "catch-all PreToolUse entry must exist when can_use_tool is set"
+        )
+
+    async def test_can_use_tool_with_existing_catchall_not_duplicated(self):
+        # If the user's PreToolUse hook is ALREADY a catch-all (matcher=None),
+        # one shim entry covers every tool, so no extra catch-all is appended.
+        async def _h(inp, tuid, ctx):  # noqa: ANN001, ANN202
+            return {}
+
+        async def _can_use(name, inp, ctx):  # noqa: ANN001, ANN202
+            return PermissionResultAllow()
+
+        server = HookIpcServer(
+            hooks={"PreToolUse": [HookMatcher(matcher=None, hooks=[_h])]},
+            can_use_tool=_can_use,
+        )
+        block = build_hooks_settings(server)
+        pre = block["PreToolUse"]
+        assert len(pre) == 1
+        assert "matcher" not in pre[0]
 
     async def test_timeout_seconds_emitted(self):
         async def _h(inp, tuid, ctx):  # noqa: ANN001, ANN202
@@ -266,6 +291,112 @@ class TestDispatch:
         assert out["systemMessage"] == "from-user-hook"
         assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
 
+    async def test_can_use_tool_consulted_for_unmatched_tool(self):
+        # W2 bypass: a user PreToolUse hook matched ONLY to "Bash" plus
+        # can_use_tool. A Write (outside the matcher) must still reach
+        # can_use_tool and be DENIED -- the user hook simply does not fire.
+        user_seen = []
+
+        async def _bash_only(inp, tuid, ctx):  # noqa: ANN001, ANN202
+            user_seen.append(inp["tool_name"])
+            return {}
+
+        async def _can_use(name, inp, ctx):  # noqa: ANN001, ANN202
+            return PermissionResultDeny(message="blocked by can_use_tool")
+
+        server = HookIpcServer(
+            hooks={"PreToolUse": [HookMatcher(matcher="Bash", hooks=[_bash_only])]},
+            can_use_tool=_can_use,
+        )
+        # The CLI fires the shim for Write because of the synthetic catch-all
+        # entry that build_hooks_settings now always emits.
+        out = await server._dispatch(
+            {
+                "hook_event_name": "PreToolUse",
+                "tool_name": "Write",
+                "tool_input": {"file_path": "/a", "content": "x"},
+                "tool_use_id": "tu_w",
+            }
+        )
+        assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
+        assert out["hookSpecificOutput"]["permissionDecisionReason"] == (
+            "blocked by can_use_tool"
+        )
+        # The user's Bash-only hook must NOT have fired for a Write.
+        assert user_seen == []
+
+    async def test_can_use_tool_not_double_invoked_for_same_tool_use_id(self):
+        # W2 dedup: the CLI may fire the shim twice for a tool that matches BOTH
+        # the synthetic catch-all AND the user's narrow matcher (e.g. Bash).
+        # can_use_tool must be consulted EXACTLY once per tool_use_id; the cached
+        # decision is replayed for the second fire.
+        calls = []
+        decisions = []
+
+        async def _bash_hook(inp, tuid, ctx):  # noqa: ANN001, ANN202
+            return {}
+
+        async def _can_use(name, inp, ctx):  # noqa: ANN001, ANN202
+            calls.append(name)
+            return PermissionResultDeny(message="no")
+
+        server = HookIpcServer(
+            hooks={"PreToolUse": [HookMatcher(matcher="Bash", hooks=[_bash_hook])]},
+            can_use_tool=_can_use,
+            on_permission_decision=lambda n, d, t: decisions.append((n, d, t)),
+        )
+        event = {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": "ls"},
+            "tool_use_id": "tu_dup",
+        }
+        first = await server._dispatch(dict(event))
+        second = await server._dispatch(dict(event))
+        # Same authoritative decision both times...
+        assert first["hookSpecificOutput"]["permissionDecision"] == "deny"
+        assert second["hookSpecificOutput"]["permissionDecision"] == "deny"
+        # ...but the callback ran only ONCE, and the transport was notified once.
+        assert calls == ["Bash"]
+        assert decisions == [("Bash", "deny", "tu_dup")]
+
+    async def test_can_use_tool_without_tool_use_id_not_deduped(self):
+        # No usable tool_use_id -> no stable dedup key; each fire runs the
+        # callback (safe: the common case fires the shim once anyway).
+        calls = []
+
+        async def _can_use(name, inp, ctx):  # noqa: ANN001, ANN202
+            calls.append(name)
+            return PermissionResultAllow()
+
+        server = HookIpcServer(hooks=None, can_use_tool=_can_use)
+        event = {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Write",
+            "tool_input": {},
+        }
+        await server._dispatch(dict(event))
+        await server._dispatch(dict(event))
+        assert calls == ["Write", "Write"]
+
+    async def test_non_tool_event_with_matcher_still_fires(self):
+        # W4: a user matcher on a NON-tool event (UserPromptSubmit/Stop/...) has
+        # no tool matchQuery on the CLI side -> the CLI fires every matcher
+        # regardless. Mirror that: the callback must fire even though the
+        # matcher pattern would not match a (None) tool name.
+        seen = []
+
+        async def _h(inp, tuid, ctx):  # noqa: ANN001, ANN202
+            seen.append(inp.get("hook_event_name"))
+            return {}
+
+        server = HookIpcServer(
+            hooks={"UserPromptSubmit": [HookMatcher(matcher="something", hooks=[_h])]},
+            can_use_tool=None,
+        )
+        await server._dispatch({"hook_event_name": "UserPromptSubmit", "prompt": "hi"})
+        assert seen == ["UserPromptSubmit"]
+
 
 # --------------------------------------------------------------------------- #
 # Server lifecycle + real round-trip via the shim subprocess
@@ -298,6 +429,33 @@ class TestServerLifecycleAndShim:
             await server.stop()
         # Double-stop is safe.
         await server.stop()
+
+    async def test_uses_unix_socket_in_0700_dir_on_posix(self):
+        # W1: AF_UNIX is on the `socket` module (not `os`); the start() guard now
+        # checks hasattr(socket, "AF_UNIX"), so POSIX uses a Unix domain socket in
+        # a private 0700 dir, NOT the TCP loopback fallback.
+        import socket as _socket
+        import stat
+        from pathlib import Path
+
+        if not (hasattr(anyio, "create_unix_listener") and hasattr(_socket, "AF_UNIX")):
+            pytest.skip("AF_UNIX unavailable on this platform")
+
+        server = HookIpcServer(hooks=None, can_use_tool=lambda *a: None)
+        await server.start()
+        try:
+            assert server.spec.startswith("unix:"), (
+                f"expected a unix socket spec on POSIX, got {server.spec!r}"
+            )
+            sock_path = Path(server.spec.split(":", 2)[1])
+            assert sock_path.exists()
+            # The containing temp dir must be private (0700) for defense-in-depth.
+            mode = stat.S_IMODE(sock_path.parent.stat().st_mode)
+            assert mode == 0o700, f"socket dir mode {oct(mode)} is not 0700"
+        finally:
+            await server.stop()
+        # The socket file + its temp dir are cleaned up on stop().
+        assert not sock_path.exists()
 
     async def test_real_shim_round_trip(self):
         async def _can_use(name, inp, ctx):  # noqa: ANN001, ANN202

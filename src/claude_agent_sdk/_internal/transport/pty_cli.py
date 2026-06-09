@@ -1355,12 +1355,21 @@ class PtyCLITransport(Transport):
                 with contextlib.suppress(Exception):
                     self._question_stream.feed(data)
 
-    @staticmethod
-    def _close_stderr_pipe(write_fd: int | None) -> None:
-        """Close a half-opened stderr write end after a failed spawn (H3)."""
+    def _close_stderr_pipe(self, write_fd: int | None) -> None:
+        """Close the stderr pipe ends after a failed spawn (H3/W3).
+
+        Closes BOTH the half-opened write end and the parent's read end (and
+        clears ``_stderr_read_fd``), so a failed ``Popen`` never leaks the read
+        fd even when a direct ``PtyCLITransport`` caller skips ``close()`` after
+        a failed ``connect()``.
+        """
         if write_fd is not None:
             with contextlib.suppress(OSError):
                 os.close(write_fd)
+        if self._stderr_read_fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(self._stderr_read_fd)
+            self._stderr_read_fd = None
 
     async def _stderr_loop(self) -> None:
         """Read the child's dedicated stderr pipe and call options.stderr per line.

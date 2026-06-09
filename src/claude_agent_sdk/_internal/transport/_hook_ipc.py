@@ -33,8 +33,8 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import secrets
+import socket
 import sys
 import tempfile
 from collections.abc import Awaitable, Callable
@@ -136,6 +136,17 @@ class HookIpcServer:
         self._spec: str | None = None
         self._unix_path: str | None = None
 
+        # can_use_tool dedup cache (W2): the CLI may fire the shim more than once
+        # for the SAME tool call (a tool that matches BOTH the synthetic catch-all
+        # PreToolUse entry AND the user's narrow PreToolUse matcher). We must
+        # consult can_use_tool exactly once per ``tool_use_id`` -- so cache the
+        # first permission output and replay it for any later fire of the same id
+        # without re-invoking the callback. Keyed by tool_use_id; bounded so a
+        # long session cannot grow it without limit.
+        self._cut_decisions: dict[str, dict[str, Any]] = {}
+        self._cut_order: list[str] = []
+        self._cut_lock = anyio.Lock()
+
     # ------------------------------------------------------------------ #
     # Lifecycle
     # ------------------------------------------------------------------ #
@@ -160,7 +171,10 @@ class HookIpcServer:
         scoped); falls back to a TCP loopback listener where AF_UNIX is
         unavailable (e.g. Windows).
         """
-        if hasattr(anyio, "create_unix_listener") and hasattr(os, "AF_UNIX"):
+        # ``AF_UNIX`` is a constant on the ``socket`` module (NOT ``os``); the
+        # earlier ``hasattr(os, "AF_UNIX")`` guard was always False, so the Unix
+        # branch was dead and POSIX silently fell back to TCP loopback.
+        if hasattr(anyio, "create_unix_listener") and hasattr(socket, "AF_UNIX"):
             # Place the socket in a private temp dir with a random name so other
             # local users cannot connect to it (dir is 0700 by default).
             tmpdir = tempfile.mkdtemp(prefix="claude-agent-sdk-hook-")
@@ -314,7 +328,7 @@ class HookIpcServer:
             and self._can_use_tool is not None
             and isinstance(tool_name, str)
         ):
-            perm = await self._run_can_use_tool(event, tool_name, tool_use_id)
+            perm = await self._run_can_use_tool_deduped(event, tool_name, tool_use_id)
             if perm is not None:
                 # A can_use_tool decision is authoritative for the permission
                 # channel: it overrides any permission opinion a user hook set,
@@ -332,9 +346,17 @@ class HookIpcServer:
         matchers = self._hooks.get(event_name) if isinstance(event_name, str) else None
         if not matchers:
             return []
+        # Only tool-matched events (PreToolUse/PostToolUse/...) filter by the
+        # tool-name matcher. For non-tool events (UserPromptSubmit/Stop/
+        # SessionStart/...) the CLI has no tool ``matchQuery`` and fires every
+        # configured matcher regardless of its pattern (utils/hooks.ts
+        # getMatchingHooks: ``matchQuery ? filter(...) : hookMatchers``). Mirror
+        # that here so a user matcher on a non-tool event still fires (W4) --
+        # otherwise ``_matcher_matches(pattern, None)`` would wrongly drop it.
+        is_tool_event = event_name in _TOOL_MATCHED_EVENTS
         callbacks: list[Callable[..., Awaitable[Any]]] = []
         for matcher in matchers:
-            if self._matcher_matches(matcher.matcher, tool_name):
+            if not is_tool_event or self._matcher_matches(matcher.matcher, tool_name):
                 callbacks.extend(matcher.hooks)
         return callbacks
 
@@ -370,6 +392,40 @@ class HookIpcServer:
                 decision,
                 tool_use_id if isinstance(tool_use_id, str) else None,
             )
+
+    async def _run_can_use_tool_deduped(
+        self,
+        event: dict[str, Any],
+        tool_name: str,
+        tool_use_id: Any,
+    ) -> dict[str, Any] | None:
+        """Consult can_use_tool at most once per ``tool_use_id`` (W2).
+
+        The synthetic catch-all PreToolUse entry can fire the shim a second time
+        for a tool that ALSO matches the user's narrow PreToolUse matcher. Without
+        dedup that would invoke ``can_use_tool`` twice for one tool call. We cache
+        the first decision under ``tool_use_id`` and replay it; calls without a
+        usable id are not deduped (no stable key), which is safe -- they just run
+        the callback (the common case fires the shim once anyway).
+        """
+        if not isinstance(tool_use_id, str) or not tool_use_id:
+            return await self._run_can_use_tool(event, tool_name, tool_use_id)
+
+        async with self._cut_lock:
+            cached = self._cut_decisions.get(tool_use_id)
+            if cached is not None:
+                # Already decided for this exact tool call: replay (do NOT
+                # re-invoke the callback, and do NOT re-notify the transport).
+                return cached
+            perm = await self._run_can_use_tool(event, tool_name, tool_use_id)
+            if perm is not None:
+                self._cut_decisions[tool_use_id] = perm
+                self._cut_order.append(tool_use_id)
+                # Bound the cache so a long session cannot grow it unboundedly.
+                if len(self._cut_order) > 512:
+                    evicted = self._cut_order.pop(0)
+                    self._cut_decisions.pop(evicted, None)
+            return perm
 
     async def _run_can_use_tool(
         self,
@@ -478,12 +534,22 @@ def build_hooks_settings(
         if entries:
             hooks_block[event] = entries
 
-    # Synthetic PreToolUse hook for can_use_tool routing. If the user already
-    # configured PreToolUse hooks above, the shim is already wired for that event
-    # (one shim call dispatches BOTH the user hooks AND can_use_tool), so only add
-    # a catch-all entry when there is none yet.
-    if server._can_use_tool is not None and "PreToolUse" not in hooks_block:  # noqa: SLF001
-        hooks_block["PreToolUse"] = [{"hooks": [_command_hook()]}]
+    # Synthetic catch-all PreToolUse hook for can_use_tool routing. The
+    # permission callback MUST be consulted for EVERY tool, so we ALWAYS ensure a
+    # catch-all (no-matcher) PreToolUse shim entry exists -- otherwise a user with
+    # a narrowly-matched PreToolUse hook (e.g. matcher="Bash") would only wire the
+    # shim for that tool, and can_use_tool would never be consulted for any other
+    # tool (Write/Edit/...), silently auto-allowing them (a permission bypass).
+    #
+    # A second catch-all entry alongside the user's narrow entry can make the CLI
+    # fire the shim TWICE for a tool that matches BOTH (e.g. Bash). The SDK-side
+    # dispatch dedups can_use_tool per ``tool_use_id`` so the callback runs at most
+    # once per tool call, while the user's matching PreToolUse hooks still run.
+    if server._can_use_tool is not None:  # noqa: SLF001
+        pre = hooks_block.setdefault("PreToolUse", [])
+        has_catchall = any("matcher" not in entry for entry in pre)
+        if not has_catchall:
+            pre.append({"hooks": [_command_hook()]})
 
     return hooks_block
 

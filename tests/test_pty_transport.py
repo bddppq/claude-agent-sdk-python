@@ -3426,3 +3426,57 @@ class TestCanUseToolViaHookGuard:
         t._on_hook_permission_decision("Write", "deny", "tu_1")
         t._on_hook_permission_decision("Read", "allow", "tu_2")
         assert t._pending_denied_tools == ["Write"]
+
+
+class TestStderrPipeFailedSpawnCleanup:
+    """W3: a failed Popen must not leak the stderr-pipe read fd."""
+
+    def test_close_stderr_pipe_closes_both_ends(self):
+        import os
+
+        t = make_transport(stderr=lambda line: None)
+        r, w = os.pipe()
+        t._stderr_read_fd = r
+        t._close_stderr_pipe(w)
+        # Both ends are closed and the read fd is cleared.
+        assert t._stderr_read_fd is None
+        for fd in (r, w):
+            with pytest.raises(OSError):
+                os.fstat(fd)
+
+    def test_failed_spawn_closes_stderr_read_fd(self, monkeypatch):
+        import os
+
+        t = make_transport(stderr=lambda line: None)
+
+        # Skip the heavyweight pre-Popen setup (api monitor / hook IPC / config)
+        # so the test isolates the spawn-failure fd cleanup.
+        async def _noop():
+            return None
+
+        monkeypatch.setattr(t, "_start_api_monitor", _noop)
+        monkeypatch.setattr(t, "_start_hook_ipc", _noop)
+        monkeypatch.setattr(t, "_ensure_onboarding_complete", lambda: None)
+        monkeypatch.setattr(t, "_build_command", lambda: ["/bin/claude"])
+
+        captured: dict[str, int | None] = {}
+
+        def _boom(*args, **kwargs):  # noqa: ANN002, ANN003
+            # Record the read fd that connect() opened so we can assert it closed.
+            captured["read_fd"] = t._stderr_read_fd
+            raise OSError("spawn failed")
+
+        monkeypatch.setattr(pty_cli, "Popen", _boom)
+
+        from claude_agent_sdk._errors import CLIConnectionError
+
+        with pytest.raises(CLIConnectionError):
+            anyio.run(t.connect)
+
+        read_fd = captured["read_fd"]
+        assert read_fd is not None  # the pipe was created (stderr callback set)
+        # The read fd is closed and the attribute cleared (no leak), even though
+        # close() was never called on this failed-connect transport.
+        assert t._stderr_read_fd is None
+        with pytest.raises(OSError):
+            os.fstat(read_fd)
