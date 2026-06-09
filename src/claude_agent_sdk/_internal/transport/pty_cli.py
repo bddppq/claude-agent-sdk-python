@@ -152,6 +152,31 @@ _WARMUP_SECONDS = 1.5
 # a long-lived multi-turn client.
 _SEEN_UUIDS_MAX = 2_048
 
+# Background-task tracking. Tools that spawn work which outlives the turn that
+# started it. ``Bash`` only spawns a background task when its
+# ``run_in_background`` input is set, so it is matched separately.
+_BACKGROUND_TASK_TOOLS = frozenset({"Monitor", "Agent", "Workflow"})
+
+# Terminal <status> values in a <task-notification>: once a task reports one of
+# these it is done and stops holding the turn open. ``pending``/``running`` are
+# non-terminal and keep the turn alive.
+_TERMINAL_TASK_STATUSES = frozenset({"completed", "failed", "killed"})
+
+# A <task-notification> is injected as a user transcript record when a background
+# task changes state. We pull the tool-use id and status out of its XML to drain
+# the pending set. Tags can appear in any order, so each is matched on its own.
+_TASK_NOTIFICATION_RE = re.compile(
+    r"<task-notification>(.*?)</task-notification>", re.DOTALL
+)
+_TASK_TOOL_USE_ID_RE = re.compile(r"<tool-use-id>\s*([^<\s]+)\s*</tool-use-id>")
+_TASK_STATUS_RE = re.compile(r"<status>\s*([^<\s]+)\s*</status>")
+
+# Safety cap on how long the turn is held open waiting for background tasks. The
+# CLI bounds its own tasks (e.g. Monitor's max watch window), so this is a
+# backstop against a task that never reports terminal: once exceeded, the turn
+# finishes with whatever has accumulated. Matches the CLI's 1h Monitor ceiling.
+_BACKGROUND_TASK_WAIT_CAP_SECS = 3600.0
+
 # Order the TUI cycles through on shift+tab. bypassPermissions is not part of
 # the cycle (it is only reachable via launch flag), so it cannot be set live.
 _PERMISSION_CYCLE = ("default", "acceptEdits", "plan")
@@ -325,6 +350,15 @@ class PtyCLITransport(Transport):
         self._closed = False
         self._input_ended = False
         self._result_emitted = False
+        # Background-task hold: tool-use ids of tasks the agent spawned that have
+        # not yet reported a terminal <task-notification>. While non-empty, the
+        # turn is held open past turn_duration so the work is not orphaned by
+        # closing the session -- matching ``claude -p``, which blocks on
+        # background tasks before exiting.
+        self._pending_tasks: set[str] = set()
+        # Monotonic deadline for the whole hold, set on the first deferral and
+        # cleared when a real result is emitted. ``None`` means "not waiting".
+        self._task_wait_deadline: float | None = None
         self._warmed_up = False
         self._spawn_time = 0.0
         # Tail of recent PTY output, kept for diagnostics if the CLI exits
@@ -1845,8 +1879,33 @@ class PtyCLITransport(Transport):
                             await self._emit_line(raw_line)
 
                 # One-shot termination: input has been closed and the turn
-                # finished, so there is nothing more to wait for.
+                # finished, so there is nothing more to wait for. While a
+                # background task holds the turn, _emit_result defers (leaving
+                # _result_emitted False), so this naturally does not fire until
+                # the tasks drain and the terminal result is emitted.
                 if self._input_ended and self._result_emitted:
+                    break
+
+                # Background-task hold timed out: a spawned task never reported
+                # terminal within the cap. Stop waiting, finish the turn with
+                # whatever accumulated, and terminate -- without this a hung task
+                # would hold the turn open forever.
+                if (
+                    self._input_ended
+                    and self._pending_tasks
+                    and self._task_wait_deadline is not None
+                    and time.monotonic() >= self._task_wait_deadline
+                ):
+                    logger.warning(
+                        "Background task hold: %d task(s) still pending after "
+                        "%.0fs; finishing turn.",
+                        len(self._pending_tasks),
+                        _BACKGROUND_TASK_WAIT_CAP_SECS,
+                    )
+                    self._pending_tasks.clear()
+                    await self._emit_result(
+                        {"durationMs": 0, "uuid": str(uuid.uuid4())}
+                    )
                     break
 
                 # Process exited; drain any remaining content, then stop.
@@ -1942,6 +2001,10 @@ class PtyCLITransport(Transport):
             self._seen_uuids[uid] = None
             while len(self._seen_uuids) > _SEEN_UUIDS_MAX:
                 self._seen_uuids.popitem(last=False)
+
+        # Track background tasks (spawn tool_use / terminal task-notification) so
+        # the turn can be held open past turn_duration until they finish.
+        self._track_background_tasks(entry)
 
         # turn_duration is the turn-complete signal -> synthesize a result that
         # carries the turn's final text, accumulated usage, and error state.
@@ -2229,12 +2292,73 @@ class PtyCLITransport(Transport):
         if error_status is not None:
             result["api_error_status"] = error_status
 
+    def _track_background_tasks(self, entry: dict[str, Any]) -> None:
+        """Track background tasks the agent spawns and the records that end them.
+
+        The turn is held open while any spawned task is still running. An
+        ``assistant`` ``tool_use`` for a background-spawning tool
+        (``Monitor``/``Agent``/``Workflow``, or ``Bash`` with
+        ``run_in_background``) adds that task keyed by its tool-use id; a
+        ``user`` record carrying a ``<task-notification>`` with a terminal
+        ``<status>`` drains it. tool-use id is the uniform correlation key
+        between the two. Both add and discard are idempotent, so a re-read of
+        the same record (streamed snapshot, compaction) is harmless.
+        """
+        entry_type = entry.get("type")
+        message = entry.get("message")
+        if not isinstance(message, dict):
+            return
+        content = message.get("content")
+        if entry_type == "assistant" and isinstance(content, list):
+            for block in content:
+                if not isinstance(block, dict) or block.get("type") != "tool_use":
+                    continue
+                name = block.get("name")
+                tool_input = block.get("input")
+                is_background = name in _BACKGROUND_TASK_TOOLS or (
+                    name == "Bash"
+                    and isinstance(tool_input, dict)
+                    and bool(tool_input.get("run_in_background"))
+                )
+                tool_use_id = block.get("id")
+                if is_background and isinstance(tool_use_id, str):
+                    self._pending_tasks.add(tool_use_id)
+            return
+        if entry_type == "user" and self._pending_tasks:
+            text = content if isinstance(content, str) else json.dumps(content)
+            if "<task-notification>" not in text:
+                return
+            for body in _TASK_NOTIFICATION_RE.findall(text):
+                status_match = _TASK_STATUS_RE.search(body)
+                id_match = _TASK_TOOL_USE_ID_RE.search(body)
+                if (
+                    status_match
+                    and id_match
+                    and status_match.group(1) in _TERMINAL_TASK_STATUSES
+                ):
+                    self._pending_tasks.discard(id_match.group(1))
+
     async def _emit_result(self, entry: dict[str, Any]) -> None:
         """Synthesize and emit a result from a ``turn_duration`` record."""
         # A deny (RR1) or interrupt (R4) may have already emitted a terminating
         # result for this turn; a stray turn_duration must not double-emit.
         if self._result_emitted:
             return
+        # Hold the turn open while the agent has live background tasks: this
+        # turn_duration is not terminal -- the agent will continue once a task
+        # reports back. Defer the result and reset per-turn state so the
+        # continuation turn accumulates cleanly, arming the wait deadline on the
+        # first deferral. The terminal result is emitted on the turn_duration
+        # that fires once _pending_tasks has drained (see _tail_loop cap).
+        if self._pending_tasks:
+            if self._task_wait_deadline is None:
+                self._task_wait_deadline = (
+                    time.monotonic() + _BACKGROUND_TASK_WAIT_CAP_SECS
+                )
+            self._reset_turn_state()
+            return
+        # Reached a terminal turn_duration with no tasks pending: disarm the hold.
+        self._task_wait_deadline = None
         self._turn_count += 1
         duration = entry.get("durationMs", 0)
         # num_turns = (tool_result records this turn) + 1. Each tool_result is
