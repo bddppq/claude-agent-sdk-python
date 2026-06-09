@@ -3480,3 +3480,182 @@ class TestStderrPipeFailedSpawnCleanup:
         assert t._stderr_read_fd is None
         with pytest.raises(OSError):
             os.fstat(read_fd)
+
+
+def _spawn_record(uuid_, tool_id, name, text, extra_input=None):
+    """An assistant record that emits some text and a background-spawning tool_use."""
+    tool_input = {"shellId": "x"}
+    if extra_input:
+        tool_input.update(extra_input)
+    return {
+        "type": "assistant",
+        "sessionId": "s",
+        "uuid": uuid_,
+        "message": {
+            "role": "assistant",
+            "model": "m",
+            "content": [
+                {"type": "text", "text": text},
+                {"type": "tool_use", "id": tool_id, "name": name, "input": tool_input},
+            ],
+        },
+    }
+
+
+def _notification_record(uuid_, tool_id, status):
+    """A user record carrying a <task-notification> for a background task."""
+    return {
+        "type": "user",
+        "sessionId": "s",
+        "uuid": uuid_,
+        "message": {
+            "role": "user",
+            "content": (
+                f"<task-notification><task-id>t</task-id>"
+                f"<tool-use-id>{tool_id}</tool-use-id>"
+                f"<status>{status}</status></task-notification>"
+            ),
+        },
+    }
+
+
+def _run_tail(t, records, tmp_path):
+    async def _test():
+        path = tmp_path / "s.jsonl"
+        path.write_text("\n".join(json.dumps(r) for r in records) + "\n")
+        t._transcript_path = path
+        t._out_send, t._out_recv = anyio.create_memory_object_stream(100)
+        t._input_ended = True
+        with anyio.fail_after(5):
+            await t._tail_loop()
+        return _drain(t)
+
+    return anyio.run(_test)
+
+
+class TestBackgroundTaskHold:
+    """Hold the turn open until spawned background tasks finish (like claude -p)."""
+
+    def test_holds_turn_until_task_completes(self, tmp_path):
+        # Monitor spawns a background task; the first turn_duration must NOT end
+        # the turn. Only after the terminal <task-notification> drains the
+        # pending set does the next turn_duration produce the (single) result --
+        # and it carries the continuation turn's text, not the spawn turn's.
+        t = make_transport()
+        records = [
+            _spawn_record("a1", "tu_mon", "Monitor", "starting watch"),
+            {
+                "type": "system",
+                "subtype": "turn_duration",
+                "durationMs": 5,
+                "uuid": "td1",
+            },
+            _notification_record("u1", "tu_mon", "completed"),
+            {
+                "type": "assistant",
+                "sessionId": "s",
+                "uuid": "a2",
+                "message": {
+                    "role": "assistant",
+                    "model": "m",
+                    "content": [{"type": "text", "text": "watch done"}],
+                },
+            },
+            {
+                "type": "system",
+                "subtype": "turn_duration",
+                "durationMs": 7,
+                "uuid": "td2",
+            },
+        ]
+        msgs = _run_tail(t, records, tmp_path)
+        results = [m for m in msgs if m["type"] == "result"]
+        assert len(results) == 1
+        assert results[0]["result"] == "watch done"
+        assert results[0]["is_error"] is False
+        assert t._pending_tasks == set()
+
+    def test_timeout_cap_finishes_a_hung_task(self, tmp_path):
+        # A task that never reports terminal must not hold the turn forever: once
+        # the cap elapses the loop synthesizes a result and terminates.
+        t = make_transport()
+        records = [
+            _spawn_record("a1", "tu_ag", "Agent", "dispatching"),
+            {
+                "type": "system",
+                "subtype": "turn_duration",
+                "durationMs": 5,
+                "uuid": "td1",
+            },
+        ]
+        with patch.object(pty_cli, "_BACKGROUND_TASK_WAIT_CAP_SECS", 0.05):
+            msgs = _run_tail(t, records, tmp_path)
+        results = [m for m in msgs if m["type"] == "result"]
+        assert len(results) == 1
+        assert t._pending_tasks == set()
+
+    def test_track_bash_run_in_background_only(self):
+        # Bash counts as a background task only when run_in_background is set.
+        bg = make_transport()
+        bg._track_background_tasks(
+            {
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "b1",
+                            "name": "Bash",
+                            "input": {"command": "sleep 1", "run_in_background": True},
+                        }
+                    ]
+                },
+            }
+        )
+        assert bg._pending_tasks == {"b1"}
+
+        fg = make_transport()
+        fg._track_background_tasks(
+            {
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "b2",
+                            "name": "Bash",
+                            "input": {"command": "ls"},
+                        }
+                    ]
+                },
+            }
+        )
+        assert fg._pending_tasks == set()
+
+    def test_non_terminal_status_does_not_drain(self):
+        # A 'running' notification must keep the task pending; only terminal
+        # statuses (completed/failed/killed) drain it.
+        t = make_transport()
+        t._pending_tasks.add("b1")
+        t._track_background_tasks(
+            {
+                "type": "user",
+                "message": {
+                    "content": _notification_record("u", "b1", "running")["message"][
+                        "content"
+                    ]
+                },
+            }
+        )
+        assert t._pending_tasks == {"b1"}
+        t._track_background_tasks(
+            {
+                "type": "user",
+                "message": {
+                    "content": _notification_record("u", "b1", "failed")["message"][
+                        "content"
+                    ]
+                },
+            }
+        )
+        assert t._pending_tasks == set()
