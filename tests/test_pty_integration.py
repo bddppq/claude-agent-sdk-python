@@ -70,6 +70,26 @@ if mode == "stderr":
     os.write(2, b"stderr line one\n")
     os.write(2, b"stderr line two\n")
 
+
+def _run_shim(event):
+    # Locate the synthesized shim command from --settings and run it with the
+    # hook-event JSON on stdin, returning the parsed decision (win #3 chain).
+    import subprocess
+    settings_raw = argv[argv.index("--settings") + 1] if "--settings" in argv else "{}"
+    settings = json.loads(settings_raw)
+    hooks = settings.get("hooks", {})
+    matchers = hooks.get(event.get("hook_event_name"), [])
+    if not matchers:
+        return {}
+    command = matchers[0]["hooks"][0]["command"]
+    proc = subprocess.run(command, shell=True, input=json.dumps(event),
+                          capture_output=True, text=True, env=os.environ.copy())
+    try:
+        return json.loads(proc.stdout) if proc.stdout.strip() else {}
+    except Exception:
+        return {}
+
+
 path = os.environ["FAKE_TRANSCRIPT"]
 os.makedirs(os.path.dirname(path), exist_ok=True)
 
@@ -97,6 +117,27 @@ while True:
         turn += 1
         append({"type": "user", "sessionId": sid, "uuid": "u%d" % turn,
                 "message": {"role": "user", "content": line}})
+        if mode == "hooks":
+            # Simulate the CLI firing PreToolUse + PostToolUse for a Write, run
+            # the shim for each, and record the decisions where the test reads
+            # them. Honors the PreToolUse permissionDecision: deny -> skip the
+            # tool_result; allow -> use updatedInput if present.
+            pre = _run_shim({"hook_event_name": "PreToolUse", "tool_name": "Write",
+                             "tool_input": {"file_path": "/tmp/x.txt", "content": "ORIG"},
+                             "tool_use_id": "tu_%d" % turn})
+            with open(os.environ["FAKE_HOOK_OUT"], "a", encoding="utf-8") as f:
+                f.write(json.dumps({"event": "PreToolUse", "decision": pre}) + "\n")
+                f.flush()
+            hso = pre.get("hookSpecificOutput", {}) if isinstance(pre, dict) else {}
+            decision = hso.get("permissionDecision")
+            eff_input = hso.get("updatedInput", {"file_path": "/tmp/x.txt", "content": "ORIG"})
+            if decision != "deny":
+                post = _run_shim({"hook_event_name": "PostToolUse", "tool_name": "Write",
+                                  "tool_input": eff_input, "tool_response": {"ok": True},
+                                  "tool_use_id": "tu_%d" % turn})
+                with open(os.environ["FAKE_HOOK_OUT"], "a", encoding="utf-8") as f:
+                    f.write(json.dumps({"event": "PostToolUse", "decision": post}) + "\n")
+                    f.flush()
         if mode == "tool":
             append({"type": "user", "sessionId": sid, "uuid": "tr%d" % turn,
                     "message": {"role": "user", "content": [
@@ -140,6 +181,8 @@ def _setup(
     )
     monkeypatch.setenv("FAKE_TRANSCRIPT", str(transcript))
     monkeypatch.setenv("FAKE_MODE", mode)
+    # Where the "hooks" fake-CLI mode records the shim decisions for assertion.
+    monkeypatch.setenv("FAKE_HOOK_OUT", str(tmp_path / "hook_decisions.jsonl"))
     # Skip the version-check subprocess and the multi-second TUI warmup.
     monkeypatch.setenv("CLAUDE_AGENT_SDK_SKIP_VERSION_CHECK", "1")
     monkeypatch.setattr(
@@ -272,14 +315,224 @@ class TestPromptFidelity:
 
 class TestOptionValidation:
     @pytest.mark.anyio
-    async def test_hooks_option_is_rejected(self, monkeypatch, tmp_path):
-        """Unsupported options fail loudly through the public query() API rather
-        than hanging or silently no-op-ing."""
+    async def test_hooks_option_is_accepted(self, monkeypatch, tmp_path):
+        """Programmatic ``hooks`` are now SUPPORTED (win #3): the turn completes
+        and the IPC bridge is wired (no CLIConnectionError)."""
+        from claude_agent_sdk import AssistantMessage, HookMatcher
+
+        async def _noop_hook(inp, tuid, ctx):  # noqa: ANN001, ANN202
+            return {}
+
+        options = _setup(monkeypatch, tmp_path)
+        options = replace(
+            options,
+            hooks={"PreToolUse": [HookMatcher(matcher=None, hooks=[_noop_hook])]},
+        )
+
+        messages = []
+        with anyio.fail_after(30):
+            async for msg in query(prompt="hi", options=options):
+                messages.append(msg)
+
+        # The turn completed normally (hooks no longer reject); the fake CLI does
+        # not run the shim, so the callback is simply never invoked here.
+        assert any(isinstance(m, AssistantMessage) for m in messages)
+
+    @pytest.mark.anyio
+    async def test_unsupported_option_still_rejected(self, monkeypatch, tmp_path):
+        """A genuinely unsupported option still fails loudly through query()."""
         from claude_agent_sdk import CLIConnectionError
 
         options = _setup(monkeypatch, tmp_path)
-        options = replace(options, hooks={"PreToolUse": [{"hooks": [lambda *a: None]}]})
+        options = replace(options, permission_prompt_tool_name="my_tool")
 
-        with pytest.raises(CLIConnectionError, match="hooks"), anyio.fail_after(30):
+        with (
+            pytest.raises(CLIConnectionError, match="permission_prompt_tool_name"),
+            anyio.fail_after(30),
+        ):
             async for _ in query(prompt="hi", options=options):
                 pass
+
+
+def _read_hook_decisions(tmp_path: Path) -> list[dict]:
+    import json as _json
+
+    out = tmp_path / "hook_decisions.jsonl"
+    if not out.exists():
+        return []
+    return [
+        _json.loads(line)
+        for line in out.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+
+class TestHookIpcBridge:
+    """win #3: programmatic hooks + can_use_tool routed through the settings-hook
+    IPC bridge end-to-end (transport -> synthesized --settings -> shim subprocess
+    -> SDK IPC server -> callbacks -> decision back to the CLI).
+
+    The fake CLI (``hooks`` mode) parses the synthesized ``--settings``, runs the
+    shim for PreToolUse (and PostToolUse) with the injected
+    ``CLAUDE_AGENT_SDK_HOOK_IPC`` env, and records the decisions for assertion.
+    """
+
+    @pytest.mark.anyio
+    async def test_pretooluse_hook_fires_with_correct_shape(
+        self, monkeypatch, tmp_path
+    ):
+        from claude_agent_sdk import HookMatcher
+
+        seen: list[tuple] = []
+
+        async def _hook(inp, tuid, ctx):  # noqa: ANN001, ANN202
+            seen.append(
+                (
+                    inp.get("hook_event_name"),
+                    inp.get("tool_name"),
+                    inp.get("tool_input"),
+                    tuid,
+                )
+            )
+            return {}
+
+        options = _setup(monkeypatch, tmp_path, mode="hooks")
+        options = replace(
+            options,
+            hooks={"PreToolUse": [HookMatcher(matcher="Write", hooks=[_hook])]},
+        )
+
+        with anyio.fail_after(30):
+            async for _ in query(prompt="go", options=options):
+                pass
+
+        assert len(seen) == 1
+        event, tool, tinput, tuid = seen[0]
+        assert event == "PreToolUse"
+        assert tool == "Write"
+        assert tinput == {"file_path": "/tmp/x.txt", "content": "ORIG"}
+        assert tuid == "tu_1"
+
+    @pytest.mark.anyio
+    async def test_pretooluse_hook_can_deny(self, monkeypatch, tmp_path):
+        from claude_agent_sdk import HookMatcher
+
+        async def _deny(inp, tuid, ctx):  # noqa: ANN001, ANN202
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": "nope",
+                }
+            }
+
+        options = _setup(monkeypatch, tmp_path, mode="hooks")
+        options = replace(
+            options, hooks={"PreToolUse": [HookMatcher(matcher=None, hooks=[_deny])]}
+        )
+
+        with anyio.fail_after(30):
+            async for _ in query(prompt="go", options=options):
+                pass
+
+        decisions = _read_hook_decisions(tmp_path)
+        pre = [d for d in decisions if d["event"] == "PreToolUse"]
+        post = [d for d in decisions if d["event"] == "PostToolUse"]
+        assert len(pre) == 1
+        assert pre[0]["decision"]["hookSpecificOutput"]["permissionDecision"] == "deny"
+        # deny short-circuits the tool -> PostToolUse never runs.
+        assert post == []
+
+    @pytest.mark.anyio
+    async def test_can_use_tool_deny_via_hook(self, monkeypatch, tmp_path):
+        from claude_agent_sdk import PermissionResultDeny
+
+        called: list[tuple] = []
+
+        async def _can_use(name, inp, ctx):  # noqa: ANN001, ANN202
+            called.append((name, inp, ctx.tool_use_id))
+            return PermissionResultDeny(message="blocked by callback")
+
+        options = _setup(monkeypatch, tmp_path, mode="hooks")
+        options = replace(options, can_use_tool=_can_use)
+
+        with anyio.fail_after(30):
+            async with ClaudeSDKClient(options=options) as client:
+                await client.query("go")
+                async for _ in client.receive_response():
+                    pass
+
+        assert len(called) == 1
+        name, inp, tuid = called[0]
+        assert name == "Write"
+        assert inp == {"file_path": "/tmp/x.txt", "content": "ORIG"}
+        assert tuid == "tu_1"
+        decisions = _read_hook_decisions(tmp_path)
+        pre = [d for d in decisions if d["event"] == "PreToolUse"][0]
+        hso = pre["decision"]["hookSpecificOutput"]
+        assert hso["permissionDecision"] == "deny"
+        assert hso["permissionDecisionReason"] == "blocked by callback"
+
+    @pytest.mark.anyio
+    async def test_can_use_tool_allow_with_updated_input(self, monkeypatch, tmp_path):
+        from claude_agent_sdk import PermissionResultAllow
+
+        async def _can_use(name, inp, ctx):  # noqa: ANN001, ANN202
+            new = dict(inp)
+            new["content"] = "REWRITTEN"
+            return PermissionResultAllow(updated_input=new)
+
+        options = _setup(monkeypatch, tmp_path, mode="hooks")
+        options = replace(options, can_use_tool=_can_use)
+
+        with anyio.fail_after(30):
+            async with ClaudeSDKClient(options=options) as client:
+                await client.query("go")
+                async for _ in client.receive_response():
+                    pass
+
+        decisions = _read_hook_decisions(tmp_path)
+        pre = [d for d in decisions if d["event"] == "PreToolUse"][0]
+        hso = pre["decision"]["hookSpecificOutput"]
+        assert hso["permissionDecision"] == "allow"
+        # The headline updated_input fidelity: the executed input is rewritten.
+        assert hso["updatedInput"]["content"] == "REWRITTEN"
+        # PostToolUse then runs with the REWRITTEN input (the CLI applies it).
+        post = [d for d in decisions if d["event"] == "PostToolUse"]
+        assert post  # tool was allowed -> PostToolUse fired
+
+    @pytest.mark.anyio
+    async def test_posttooluse_hook_fires_with_response(self, monkeypatch, tmp_path):
+        from claude_agent_sdk import HookMatcher
+
+        seen: list[tuple] = []
+
+        async def _post(inp, tuid, ctx):  # noqa: ANN001, ANN202
+            seen.append(
+                (
+                    inp.get("hook_event_name"),
+                    inp.get("tool_name"),
+                    inp.get("tool_response"),
+                )
+            )
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": "PostToolUse",
+                    "additionalContext": "noted",
+                }
+            }
+
+        options = _setup(monkeypatch, tmp_path, mode="hooks")
+        options = replace(
+            options, hooks={"PostToolUse": [HookMatcher(matcher=None, hooks=[_post])]}
+        )
+
+        with anyio.fail_after(30):
+            async for _ in query(prompt="go", options=options):
+                pass
+
+        assert len(seen) == 1
+        event, tool, response = seen[0]
+        assert event == "PostToolUse"
+        assert tool == "Write"
+        assert response == {"ok": True}

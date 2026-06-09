@@ -117,10 +117,17 @@ class HookIpcServer:
         hooks: dict[str, list[HookMatcher]] | None,
         can_use_tool: CanUseToolFn | None,
         permission_mode: str | None = None,
+        on_permission_decision: Callable[[str, str, str | None], None] | None = None,
     ) -> None:
         self._hooks = hooks or {}
         self._can_use_tool = can_use_tool
         self._permission_mode = permission_mode
+        # Optional sink invoked with (tool_name, decision, tool_use_id) right
+        # after a can_use_tool PreToolUse decision is made, so the transport can
+        # record a hook-channel deny for result.permission_denials correlation
+        # (the watcher path is not involved when the hook short-circuits the
+        # dialog). Best-effort; runs on the IPC serve task (same event loop).
+        self._on_permission_decision = on_permission_decision
 
         self._token = secrets.token_hex(16)
         self._listener: Any = None
@@ -353,6 +360,17 @@ class HookIpcServer:
         except re.error:
             return tool_name == pattern
 
+    def _notify_decision(self, tool_name: str, decision: str, tool_use_id: Any) -> None:
+        """Tell the transport about a permission decision (best-effort)."""
+        if self._on_permission_decision is None:
+            return
+        with suppress(Exception):
+            self._on_permission_decision(
+                tool_name,
+                decision,
+                tool_use_id if isinstance(tool_use_id, str) else None,
+            )
+
     async def _run_can_use_tool(
         self,
         event: dict[str, Any],
@@ -382,6 +400,7 @@ class HookIpcServer:
             result = await self._can_use_tool(tool_name, tool_input, context)
         except Exception:
             logger.debug("can_use_tool raised in hook channel; denying", exc_info=True)
+            self._notify_decision(tool_name, "deny", tool_use_id)
             return {
                 "hookSpecificOutput": {
                     "hookEventName": "PreToolUse",
@@ -397,9 +416,11 @@ class HookIpcServer:
             }
             if result.updated_input is not None:
                 hook_specific["updatedInput"] = result.updated_input
+            self._notify_decision(tool_name, "allow", tool_use_id)
             return {"hookSpecificOutput": hook_specific}
 
         if isinstance(result, PermissionResultDeny):
+            self._notify_decision(tool_name, "deny", tool_use_id)
             return {
                 "hookSpecificOutput": {
                     "hookEventName": "PreToolUse",
@@ -410,6 +431,7 @@ class HookIpcServer:
 
         # Defensive: a malformed return -> deny (matches the watcher's behavior of
         # treating non-Allow as deny).
+        self._notify_decision(tool_name, "deny", tool_use_id)
         return {
             "hookSpecificOutput": {
                 "hookEventName": "PreToolUse",

@@ -70,6 +70,7 @@ from .._task_compat import TaskHandle, spawn_detached
 from ..sessions import _canonicalize_path, _get_projects_dir, _sanitize_path
 from . import Transport, _cli_command
 from ._api_monitor import ApiMonitor
+from ._hook_ipc import ENV_HOOK_IPC, HookIpcServer, build_hooks_settings
 from ._usage import TurnUsageAccumulator, _limits_for
 from .pty_question import (
     SCREEN_COLS,
@@ -445,6 +446,24 @@ class PtyCLITransport(Transport):
         self._latest_context_usage: dict[str, Any] | None = None
         self._latest_context_model: str | None = None
 
+        # ----- Hook IPC bridge (win #3) --------------------------------- #
+        # When the caller configures programmatic ``options.hooks`` and/or
+        # ``options.can_use_tool``, connect() starts a localhost IPC server and
+        # wires the relevant hook events to a shim command via a synthesized
+        # ``--settings`` hooks block. The CLI runs the shim, which forwards the
+        # hook-event JSON to this server; the server dispatches to the user's hook
+        # callbacks and (for PreToolUse) routes tool permissions through
+        # can_use_tool, returning the CLI's permissionDecision/updatedInput. This
+        # is the DETERMINISTIC channel that the TUI-scraping watcher cannot match
+        # (notably: applying ``updated_input``). ``None`` when there is nothing to
+        # wire OR when the server failed to start (then we fall back to the
+        # watcher for permissions; programmatic hooks simply do not fire).
+        self._hook_ipc: HookIpcServer | None = None
+        # True once can_use_tool is being routed through the hook channel above;
+        # the watcher then must NOT also answer the (now-suppressed) PreToolUse
+        # permission dialog -- the hook decision short-circuits it server-side.
+        self._can_use_tool_via_hook = False
+
     # ------------------------------------------------------------------ #
     # Connection lifecycle
     # ------------------------------------------------------------------ #
@@ -476,6 +495,12 @@ class PtyCLITransport(Transport):
         # ANTHROPIC_BASE_URL can be pointed at the loopback proxy (RV2/C1/R3/R7).
         # Must happen before Popen consumes _build_env().
         await self._start_api_monitor()
+
+        # Start the hook IPC bridge (win #3) BEFORE building the command, so the
+        # synthesized ``--settings`` hooks block (which references the shim) can be
+        # merged into the CLI invocation and the shim's endpoint injected into the
+        # child env. Non-fatal: on failure we fall back to the TUI watcher.
+        await self._start_hook_ipc()
 
         cmd = self._build_command()
 
@@ -714,11 +739,10 @@ class PtyCLITransport(Transport):
         """
         o = self._options
         unsupported: list[str] = []
-        if o.hooks:
-            unsupported.append(
-                "hooks (programmatic hook callbacks require the bidirectional "
-                "control protocol; use command hooks in settings instead)"
-            )
+        # NOTE: programmatic ``hooks`` ARE now supported (win #3): connect() wires
+        # them to the CLI's settings.json command-hook mechanism via a localhost
+        # IPC shim (see _hook_ipc / _hook_shim and _start_hook_ipc below), so they
+        # are no longer rejected here.
         # ``permission_prompt_tool_name == "stdio"`` is the SDK-internal sentinel
         # the client sets when can_use_tool is provided; the interactive
         # transport answers permission prompts via the TUI detector instead, so
@@ -786,6 +810,10 @@ class PtyCLITransport(Transport):
         # is so the CLI talks to the real API directly (non-fatal degradation).
         if self._api_monitor is not None:
             env["ANTHROPIC_BASE_URL"] = self._api_monitor.base_url
+        # Hook IPC bridge (win #3): tell the shim where to reach the SDK's IPC
+        # endpoint (+ the auth token). Only set when the bridge actually started.
+        if self._hook_ipc is not None:
+            env[ENV_HOOK_IPC] = self._hook_ipc.spec
         return env
 
     def _upstream_base_url(self) -> str:
@@ -813,6 +841,70 @@ class PtyCLITransport(Transport):
             # talking to the real API directly (just without the enrichment).
             logger.debug("API monitor failed to start; continuing", exc_info=True)
             self._api_monitor = None
+
+    async def _start_hook_ipc(self) -> None:
+        """Start the settings-hook IPC bridge when there is something to wire.
+
+        Wires the user's programmatic ``options.hooks`` callbacks and -- when
+        ``options.can_use_tool`` is set -- a deterministic PreToolUse permission
+        route through the CLI's own settings.json command-hook mechanism (see
+        :mod:`._hook_ipc`). Non-fatal: any failure leaves ``_hook_ipc`` None, so
+        connect() falls back to the existing TUI watcher for permissions and
+        programmatic hooks simply do not fire (the prior behavior).
+        """
+        o = self._options
+        # ``permission_prompt_tool_name == "stdio"`` is the SDK-internal sentinel
+        # the client sets when can_use_tool is provided; a caller-supplied tool
+        # name was already rejected in _validate_options, so any truthy value here
+        # means "route can_use_tool".
+        route_can_use_tool = o.can_use_tool is not None
+        hooks = self._normalized_hooks()
+        if not hooks and not route_can_use_tool:
+            return
+        try:
+            server = HookIpcServer(
+                hooks=hooks,
+                can_use_tool=o.can_use_tool if route_can_use_tool else None,
+                permission_mode=o.permission_mode,
+                on_permission_decision=self._on_hook_permission_decision,
+            )
+            await server.start()
+            self._hook_ipc = server
+            self._can_use_tool_via_hook = route_can_use_tool
+        except Exception:
+            logger.debug("hook IPC bridge failed to start; continuing", exc_info=True)
+            self._hook_ipc = None
+            self._can_use_tool_via_hook = False
+
+    def _normalized_hooks(self) -> dict[str, list[Any]] | None:
+        """Return ``options.hooks`` as ``{event: [HookMatcher, ...]}`` or None.
+
+        ``ClaudeAgentOptions.hooks`` is typed ``dict[HookEvent, list[HookMatcher]]``
+        but tolerated loosely; we only keep events that actually carry matchers.
+        """
+        raw = self._options.hooks
+        if not raw:
+            return None
+        normalized: dict[str, list[Any]] = {}
+        for event, matchers in raw.items():
+            if matchers:
+                normalized[str(event)] = list(matchers)
+        return normalized or None
+
+    def _on_hook_permission_decision(
+        self, tool_name: str, decision: str, tool_use_id: str | None
+    ) -> None:
+        """Record a hook-channel ``can_use_tool`` deny for result correlation.
+
+        Called from the IPC serve task right after a PreToolUse permission is
+        decided. On a deny, queue the tool name so _correlate_denials can build
+        the baseline-shaped ``permission_denials`` entry from the rejected
+        ``tool_result`` that lands in the transcript -- the watcher path (which
+        normally populates this) is bypassed when the hook short-circuits the
+        dialog. Allows are not recorded (no denial entry needed).
+        """
+        if decision == "deny" and tool_name:
+            self._pending_denied_tools.append(tool_name)
 
     def _on_api_call(self, record: dict[str, Any]) -> None:
         """Receive one observed /v1/messages call from the monitor (best-effort).
@@ -1059,9 +1151,73 @@ class PtyCLITransport(Transport):
         """Build the interactive CLI command from the configured options."""
         if self._cli_path is None:
             raise CLINotFoundError("CLI path not resolved. Call connect() first.")
-        return _cli_command.build_command(
+        cmd = _cli_command.build_command(
             self._cli_path, self._options, self._session_id
         )
+        # win #3: merge the synthesized hooks block (wiring hook events to the
+        # IPC shim) into the ``--settings`` JSON the CLI parses, so the CLI runs
+        # our shim for the relevant events. Done here (not in _cli_command) so the
+        # transport-owned IPC server's address/matchers stay encapsulated.
+        if self._hook_ipc is not None:
+            cmd = self._inject_hook_settings(cmd)
+        return cmd
+
+    def _inject_hook_settings(self, cmd: list[str]) -> list[str]:
+        """Merge the IPC hooks block into the command's ``--settings`` value.
+
+        If a ``--settings`` flag is already present (caller settings and/or the
+        sandbox merge from :func:`_cli_command.build_settings_value`), parse its
+        JSON object and add/extend the ``hooks`` key; otherwise append a fresh
+        ``--settings`` carrying only ``hooks``. A non-object existing settings
+        value (e.g. a bare file path the SDK left as-is) is left untouched and the
+        hooks are appended as a SECOND ``--settings`` (the CLI merges multiple).
+        Best-effort: on any error the original command is returned unchanged.
+        """
+        assert self._hook_ipc is not None
+        try:
+            hooks_block = build_hooks_settings(self._hook_ipc)
+        except Exception:
+            logger.debug("failed to build hook settings; skipping", exc_info=True)
+            return cmd
+        if not hooks_block:
+            return cmd
+
+        new_cmd = list(cmd)
+        # Find an existing --settings flag.
+        idx = None
+        for i, arg in enumerate(new_cmd):
+            if arg == "--settings" and i + 1 < len(new_cmd):
+                idx = i + 1
+                break
+
+        if idx is None:
+            new_cmd.extend(["--settings", json.dumps({"hooks": hooks_block})])
+            return new_cmd
+
+        existing = new_cmd[idx]
+        try:
+            obj = json.loads(existing)
+        except (json.JSONDecodeError, TypeError):
+            obj = None
+        if not isinstance(obj, dict):
+            # Existing value is a path / non-object: add hooks as a second
+            # --settings (the CLI accepts and merges repeated --settings).
+            new_cmd.extend(["--settings", json.dumps({"hooks": hooks_block})])
+            return new_cmd
+
+        merged_hooks = obj.get("hooks")
+        if not isinstance(merged_hooks, dict):
+            merged_hooks = {}
+        # Our synthesized entries take precedence for the events we wire (the
+        # caller's own command hooks for those events still run -- the shim
+        # dispatches the user's programmatic hooks too, and any settings-file
+        # command hooks the CLI loads separately are unaffected by --settings).
+        for event, entries in hooks_block.items():
+            merged_hooks.setdefault(event, [])
+            merged_hooks[event] = list(merged_hooks[event]) + entries
+        obj["hooks"] = merged_hooks
+        new_cmd[idx] = json.dumps(obj)
+        return new_cmd
 
     def _compute_transcript_path(self) -> Path:
         project_dir = _get_projects_dir(
@@ -1391,7 +1547,20 @@ class PtyCLITransport(Transport):
         watcher presses the TUI's "allow all edits during this session" option
         and the grant survives for the rest of the session. Narrow rules that
         the coarse TUI option would over-grant fall back to plain ``"allow"``.
+
+        win #3: when ``can_use_tool`` is being routed through the deterministic
+        hook channel (``_can_use_tool_via_hook``), DO NOT invoke the callback
+        again here -- the PreToolUse hook already decided server-side and the CLI
+        short-circuits the dialog accordingly (allow skips the prompt; deny never
+        prompts). A permission dialog reaching the watcher in that mode is an
+        edge case (e.g. a settings ``ask`` rule that fires despite a hook allow,
+        or an unexpected non-PreToolUse permission prompt); we allow-once so the
+        turn completes rather than re-running the callback (which would
+        double-invoke it and could disagree with the authoritative hook decision).
         """
+        if self._can_use_tool_via_hook:
+            return "allow"
+
         callback = self._options.can_use_tool
         if callback is not None and question.tool:
             # RV2: prefer the FULL tool_use.input recovered from the intercepted
@@ -2675,6 +2844,13 @@ class PtyCLITransport(Transport):
             with contextlib.suppress(Exception):
                 await self._api_monitor.stop()
             self._api_monitor = None
+
+        # Stop the hook IPC bridge (win #3): cancel its serve task and unlink the
+        # socket file (no leak). Same detached-handle safety as the API monitor.
+        if self._hook_ipc is not None:
+            with contextlib.suppress(Exception):
+                await self._hook_ipc.stop()
+            self._hook_ipc = None
 
         if self._out_send is not None:
             with contextlib.suppress(Exception):

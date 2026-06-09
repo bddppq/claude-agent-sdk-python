@@ -1577,10 +1577,6 @@ class TestValidateOptions:
         ("kwargs", "needle"),
         [
             (
-                {"hooks": {"PreToolUse": [{"hooks": [lambda *a: None]}]}},
-                "hooks",
-            ),
-            (
                 {"permission_prompt_tool_name": "my_tool"},
                 "permission_prompt_tool_name",
             ),
@@ -1593,6 +1589,19 @@ class TestValidateOptions:
         with pytest.raises(CLIConnectionError) as exc:
             t._validate_options()
         assert needle in str(exc.value)
+
+    def test_hooks_is_accepted(self):
+        # Programmatic hooks are now wired via the settings-hook IPC bridge
+        # (win #3), so they must not be rejected at validation.
+        from claude_agent_sdk import HookMatcher
+
+        async def _hook(inp, tuid, ctx):  # noqa: ANN001, ANN202
+            return {}
+
+        t = make_transport(
+            hooks={"PreToolUse": [HookMatcher(matcher=None, hooks=[_hook])]}
+        )
+        t._validate_options()  # must not raise
 
     def test_can_use_tool_is_accepted(self):
         # can_use_tool is now answered via the TUI question detector (C5), so it
@@ -3306,3 +3315,114 @@ class TestContextUsageRL11:
         assert msg["type"] == "control_response"
         assert msg["response"]["subtype"] == "success"
         assert msg["response"]["response"]["totalTokens"] == 42
+
+
+class TestHookSettingsInjection:
+    """win #3: merging the synthesized hooks block into the --settings command."""
+
+    def _server(self, **kwargs):
+        from claude_agent_sdk._internal.transport._hook_ipc import HookIpcServer
+
+        async def _h(inp, tuid, ctx):  # noqa: ANN001, ANN202
+            return {}
+
+        from claude_agent_sdk.types import HookMatcher
+
+        return HookIpcServer(
+            hooks=kwargs.get(
+                "hooks", {"PreToolUse": [HookMatcher(matcher="Write", hooks=[_h])]}
+            ),
+            can_use_tool=kwargs.get("can_use_tool"),
+        )
+
+    def test_appends_settings_when_absent(self):
+        t = make_transport()
+        t._hook_ipc = self._server()
+        cmd = t._inject_hook_settings(["/bin/claude", "--model", "opus"])
+        assert "--settings" in cmd
+        idx = cmd.index("--settings") + 1
+        obj = json.loads(cmd[idx])
+        assert "PreToolUse" in obj["hooks"]
+        assert "_hook_shim" in obj["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+
+    def test_merges_into_existing_settings_object(self):
+        t = make_transport()
+        t._hook_ipc = self._server()
+        existing = json.dumps({"hooks": {"Stop": [{"hooks": []}]}, "sandbox": True})
+        cmd = t._inject_hook_settings(["/bin/claude", "--settings", existing])
+        # Still exactly one --settings flag, merged.
+        assert cmd.count("--settings") == 1
+        obj = json.loads(cmd[cmd.index("--settings") + 1])
+        assert obj["sandbox"] is True
+        assert "Stop" in obj["hooks"]
+        assert "PreToolUse" in obj["hooks"]
+
+    def test_non_object_settings_added_as_second_flag(self):
+        t = make_transport()
+        t._hook_ipc = self._server()
+        # A bare path (non-JSON-object) existing value is left untouched; hooks
+        # are appended as a second --settings (the CLI merges repeated flags).
+        cmd = t._inject_hook_settings(["/bin/claude", "--settings", "/path/to/s.json"])
+        assert cmd.count("--settings") == 2
+        # The original path is preserved.
+        assert "/path/to/s.json" in cmd
+
+    def test_no_injection_when_bridge_absent(self):
+        t = make_transport()
+        t._hook_ipc = None
+        base = ["/bin/claude", "--model", "opus"]
+        # _build_command path: with no bridge, the command is unchanged.
+        assert t._build_command.__self__ is t  # sanity
+        # Directly: _inject is only called when bridge present, so emulate that.
+        # Build a command and confirm no --settings is injected by the bridge.
+        with patch(
+            "claude_agent_sdk._internal.transport._cli_command.build_command",
+            return_value=list(base),
+        ):
+            t._cli_path = DEFAULT_CLI
+            cmd = t._build_command()
+        assert cmd == base
+
+
+class TestCanUseToolViaHookGuard:
+    """win #3: when can_use_tool is routed through the hook channel, the TUI
+    watcher must not re-invoke it for a permission dialog (no double-handling)."""
+
+    def test_decide_permission_allows_without_calling_callback(self):
+        calls = []
+
+        async def _cb(*a):  # noqa: ANN002, ANN202
+            from claude_agent_sdk import PermissionResultDeny
+
+            calls.append(a)
+            return PermissionResultDeny(message="x")
+
+        t = make_transport(can_use_tool=_cb)
+        t._can_use_tool_via_hook = True
+
+        from claude_agent_sdk._internal.transport.pty_question import (
+            DetectedQuestion,
+            QuestionOption,
+        )
+
+        q = DetectedQuestion(
+            kind="permission",
+            question="Allow Write?",
+            tool="Write",
+            target="/tmp/x",
+            options=[QuestionOption(index=1, label="Yes", action="allow_once")],
+        )
+
+        async def _run():
+            return await t._decide_permission(q)
+
+        want = anyio.run(_run)
+        assert want == "allow"
+        # The callback must NOT have been invoked by the watcher (the hook did it).
+        assert calls == []
+
+    def test_on_hook_permission_decision_records_deny(self):
+        t = make_transport()
+        t._on_hook_permission_decision("Write", "deny", "tu_1")
+        t._on_hook_permission_decision("Read", "allow", "tu_2")
+        assert t._pending_denied_tools == ["Write"]
