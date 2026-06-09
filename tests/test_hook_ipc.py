@@ -379,6 +379,308 @@ class TestDispatch:
         await server._dispatch(dict(event))
         assert calls == ["Write", "Write"]
 
+    # ------------------------------------------------------------------ #
+    # W5: deny-from-either-source wins; no stale reason leaks.
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _deny_hook(reason="hook-deny"):  # noqa: ANN001, ANN205
+        async def _h(inp, tuid, ctx):  # noqa: ANN001, ANN202
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": reason,
+                }
+            }
+
+        return _h
+
+    @staticmethod
+    def _allow_hook():  # noqa: ANN205
+        async def _h(inp, tuid, ctx):  # noqa: ANN001, ANN202
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "allow",
+                    "permissionDecisionReason": "hook-allow",
+                }
+            }
+
+        return _h
+
+    async def test_w5_hook_deny_beats_can_use_tool_allow(self):
+        # User PreToolUse hook DENY + can_use_tool ALLOW for the SAME tool ->
+        # deny wins, and the stale "hook-deny" reason does NOT leak as an
+        # allow-with-deny-reason (the surviving triplet is the deny's).
+        async def _can_use(name, inp, ctx):  # noqa: ANN001, ANN202
+            return PermissionResultAllow(updated_input={"content": "X"})
+
+        server = HookIpcServer(
+            hooks={
+                "PreToolUse": [HookMatcher(matcher=None, hooks=[self._deny_hook()])]
+            },
+            can_use_tool=_can_use,
+        )
+        out = await server._dispatch(
+            {
+                "hook_event_name": "PreToolUse",
+                "tool_name": "Write",
+                "tool_input": {"file_path": "/a", "content": "ORIG"},
+                "tool_use_id": "tu_1",
+            }
+        )
+        hso = out["hookSpecificOutput"]
+        assert hso["permissionDecision"] == "deny"
+        assert hso["permissionDecisionReason"] == "hook-deny"
+        # The allow's updatedInput must NOT leak into the surviving deny.
+        assert "updatedInput" not in hso
+
+    async def test_w5_can_use_tool_deny_beats_hook_allow(self):
+        # can_use_tool DENY + user hook ALLOW -> deny wins with can_use_tool's
+        # reason; the stale "hook-allow" reason does NOT leak.
+        async def _can_use(name, inp, ctx):  # noqa: ANN001, ANN202
+            return PermissionResultDeny(message="cut-deny")
+
+        server = HookIpcServer(
+            hooks={
+                "PreToolUse": [HookMatcher(matcher=None, hooks=[self._allow_hook()])]
+            },
+            can_use_tool=_can_use,
+        )
+        out = await server._dispatch(
+            {
+                "hook_event_name": "PreToolUse",
+                "tool_name": "Write",
+                "tool_input": {},
+                "tool_use_id": "tu_2",
+            }
+        )
+        hso = out["hookSpecificOutput"]
+        assert hso["permissionDecision"] == "deny"
+        assert hso["permissionDecisionReason"] == "cut-deny"
+
+    async def test_w5_both_allow_runs_and_updated_input_applies(self):
+        # Both allow -> allow, and a can_use_tool updated_input still applies.
+        async def _can_use(name, inp, ctx):  # noqa: ANN001, ANN202
+            new = dict(inp)
+            new["content"] = "REWRITTEN"
+            return PermissionResultAllow(updated_input=new)
+
+        server = HookIpcServer(
+            hooks={
+                "PreToolUse": [HookMatcher(matcher=None, hooks=[self._allow_hook()])]
+            },
+            can_use_tool=_can_use,
+        )
+        out = await server._dispatch(
+            {
+                "hook_event_name": "PreToolUse",
+                "tool_name": "Write",
+                "tool_input": {"file_path": "/a", "content": "ORIG"},
+                "tool_use_id": "tu_3",
+            }
+        )
+        hso = out["hookSpecificOutput"]
+        assert hso["permissionDecision"] == "allow"
+        assert hso["updatedInput"]["content"] == "REWRITTEN"
+        # The hook-allow reason must NOT leak from the superseded hook decision.
+        assert hso.get("permissionDecisionReason") != "hook-allow"
+
+    async def test_w5_both_deny_keeps_hook_reason(self):
+        # Both deny -> deny; hook's decision survives (deny == deny, hook kept).
+        async def _can_use(name, inp, ctx):  # noqa: ANN001, ANN202
+            return PermissionResultDeny(message="cut-deny")
+
+        server = HookIpcServer(
+            hooks={
+                "PreToolUse": [
+                    HookMatcher(matcher=None, hooks=[self._deny_hook("hook-reason")])
+                ]
+            },
+            can_use_tool=_can_use,
+        )
+        out = await server._dispatch(
+            {
+                "hook_event_name": "PreToolUse",
+                "tool_name": "Write",
+                "tool_input": {},
+                "tool_use_id": "tu_4",
+            }
+        )
+        hso = out["hookSpecificOutput"]
+        assert hso["permissionDecision"] == "deny"
+        # A deny is a deny from either source; the result is consistent (no
+        # allow), and exactly one reason is present.
+        assert hso["permissionDecisionReason"] in ("hook-reason", "cut-deny")
+
+    async def test_w5_hook_allow_can_use_allow_no_nonperm_field_loss(self):
+        # A non-permission field the user hook contributes is preserved when the
+        # permission triplet is replaced.
+        async def _h(inp, tuid, ctx):  # noqa: ANN001, ANN202
+            return {
+                "systemMessage": "keepme",
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": "hook-deny",
+                },
+            }
+
+        async def _can_use(name, inp, ctx):  # noqa: ANN001, ANN202
+            return PermissionResultAllow()
+
+        server = HookIpcServer(
+            hooks={"PreToolUse": [HookMatcher(matcher=None, hooks=[_h])]},
+            can_use_tool=_can_use,
+        )
+        out = await server._dispatch(
+            {
+                "hook_event_name": "PreToolUse",
+                "tool_name": "Write",
+                "tool_input": {},
+                "tool_use_id": "tu_5",
+            }
+        )
+        assert out["systemMessage"] == "keepme"
+        assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+    # ------------------------------------------------------------------ #
+    # W6: distinct concurrent ids are NOT serialized; same id consults once.
+    # ------------------------------------------------------------------ #
+
+    async def test_w6_distinct_ids_run_concurrently(self):
+        import time
+
+        started = anyio.Event()
+        n_started = 0
+        gate = anyio.Event()
+
+        async def _can_use(name, inp, ctx):  # noqa: ANN001, ANN202
+            nonlocal n_started
+            n_started += 1
+            if n_started >= 2:
+                gate.set()
+            started.set()
+            # Block until BOTH callbacks have started -- proves they overlap and
+            # are not serialized behind a single lock.
+            await gate.wait()
+            return PermissionResultAllow()
+
+        server = HookIpcServer(hooks=None, can_use_tool=_can_use)
+
+        async def _dispatch(tuid):  # noqa: ANN001, ANN202
+            await server._dispatch(
+                {
+                    "hook_event_name": "PreToolUse",
+                    "tool_name": "Write",
+                    "tool_input": {},
+                    "tool_use_id": tuid,
+                }
+            )
+
+        t0 = time.monotonic()
+        with anyio.fail_after(2):
+            async with anyio.create_task_group() as tg:
+                tg.start_soon(_dispatch, "tu_a")
+                tg.start_soon(_dispatch, "tu_b")
+        elapsed = time.monotonic() - t0
+        # If the lock were held across the callback, the second callback could
+        # never start while the first waits on the gate -> deadlock/timeout.
+        # Reaching here (both started, gate set, both returned) proves overlap.
+        assert n_started == 2
+        assert elapsed < 1.5
+
+    async def test_w6_same_id_consulted_once_under_concurrency(self):
+        calls = []
+        proceed = anyio.Event()
+
+        async def _can_use(name, inp, ctx):  # noqa: ANN001, ANN202
+            calls.append(name)
+            await proceed.wait()
+            return PermissionResultDeny(message="no")
+
+        server = HookIpcServer(hooks=None, can_use_tool=_can_use)
+        event = {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": "ls"},
+            "tool_use_id": "tu_same",
+        }
+        results = {}
+
+        async def _dispatch(key):  # noqa: ANN001, ANN202
+            results[key] = await server._dispatch(dict(event))
+
+        with anyio.fail_after(2):
+            async with anyio.create_task_group() as tg:
+                tg.start_soon(_dispatch, "first")
+                # Let the first dispatch claim the in-flight slot before the
+                # second arrives, so the second must wait+replay (not re-invoke).
+                await anyio.sleep(0.05)
+                tg.start_soon(_dispatch, "second")
+                await anyio.sleep(0.05)
+                proceed.set()
+
+        # The callback ran EXACTLY once despite two concurrent dispatches.
+        assert calls == ["Bash"]
+        assert results["first"]["hookSpecificOutput"]["permissionDecision"] == "deny"
+        assert results["second"]["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+    async def test_w6_raising_run_can_use_tool_wakes_waiters(self):
+        # Defensive: if the owner's _run_can_use_tool itself raised (e.g. a
+        # deferred import failed), the in-flight ``perm`` is pre-bound to None so
+        # the finally still publishes a result and SETS ``done`` -- a same-id
+        # waiter must NOT hang and the exception must surface to the owner.
+        server = HookIpcServer(hooks=None, can_use_tool=lambda *a, **k: None)
+
+        boom = RuntimeError("boom")
+        in_callback = anyio.Event()
+        release = anyio.Event()
+
+        async def _raise(event, tool_name, tool_use_id):  # noqa: ANN001, ANN202
+            in_callback.set()
+            # Hold inside the callback until the waiter has attached to the
+            # in-flight slot, so the waiter MUST replay (not re-invoke).
+            await release.wait()
+            raise boom
+
+        server._run_can_use_tool = _raise  # type: ignore[assignment]
+
+        owner_err: list[BaseException] = []
+        waiter_result: list[object] = []
+
+        async def _owner():  # noqa: ANN202
+            try:
+                await server._run_can_use_tool_deduped(
+                    {"tool_input": {}}, "Bash", "tu_raise"
+                )
+            except BaseException as e:  # noqa: BLE001
+                owner_err.append(e)
+
+        async def _waiter():  # noqa: ANN202
+            await in_callback.wait()
+            waiter_result.append(
+                await server._run_can_use_tool_deduped(
+                    {"tool_input": {}}, "Bash", "tu_raise"
+                )
+            )
+
+        with anyio.fail_after(2):
+            async with anyio.create_task_group() as tg:
+                tg.start_soon(_owner)
+                tg.start_soon(_waiter)
+                # Owner enters callback + waiter attaches to in-flight, THEN let
+                # the owner's callback raise.
+                await in_callback.wait()
+                await anyio.sleep(0.05)
+                release.set()
+
+        # The owner saw the real exception; the waiter did NOT hang and replayed
+        # the (None) result rather than re-invoking the failed callback.
+        assert owner_err == [boom]
+        assert waiter_result == [None]
+
     async def test_non_tool_event_with_matcher_still_fires(self):
         # W4: a user matcher on a NON-tool event (UserPromptSubmit/Stop/...) has
         # no tool matchQuery on the CLI side -> the CLI fires every matcher

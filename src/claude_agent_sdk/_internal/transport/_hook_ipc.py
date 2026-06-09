@@ -74,6 +74,22 @@ _MAX_REQUEST_BYTES = 16 * 1024 * 1024
 CanUseToolFn = Callable[..., Awaitable[Any]]
 
 
+class _CutInflight:
+    """An in-flight ``can_use_tool`` decision for one ``tool_use_id`` (W6).
+
+    The owning dispatch runs the callback (without holding ``_cut_lock``) and,
+    when done, stores ``result`` and sets ``done``. A concurrent duplicate fire
+    for the same id awaits ``done`` and replays ``result`` instead of invoking
+    the callback a second time.
+    """
+
+    __slots__ = ("done", "result")
+
+    def __init__(self) -> None:
+        self.done = anyio.Event()
+        self.result: dict[str, Any] | None = None
+
+
 def _convert_hook_output_for_cli(hook_output: dict[str, Any]) -> dict[str, Any]:
     """Convert Python-safe field names to the CLI-expected names.
 
@@ -146,6 +162,12 @@ class HookIpcServer:
         self._cut_decisions: dict[str, dict[str, Any]] = {}
         self._cut_order: list[str] = []
         self._cut_lock = anyio.Lock()
+        # In-flight decisions keyed by tool_use_id (W6). A duplicate fire for an
+        # id whose callback has NOT yet completed awaits this event and replays
+        # the single result, so the callback runs exactly once per id without
+        # holding ``_cut_lock`` across the user callback (distinct ids run
+        # concurrently; the lock only guards the cache/in-flight dicts).
+        self._cut_inflight: dict[str, _CutInflight] = {}
 
     # ------------------------------------------------------------------ #
     # Lifecycle
@@ -330,15 +352,63 @@ class HookIpcServer:
         ):
             perm = await self._run_can_use_tool_deduped(event, tool_name, tool_use_id)
             if perm is not None:
-                # A can_use_tool decision is authoritative for the permission
-                # channel: it overrides any permission opinion a user hook set,
-                # but we keep non-permission fields the user hook contributed.
-                merged.setdefault("hookSpecificOutput", {})
-                if not isinstance(merged.get("hookSpecificOutput"), dict):
-                    merged["hookSpecificOutput"] = {}
-                merged["hookSpecificOutput"].update(perm["hookSpecificOutput"])
+                self._merge_permission_decision(merged, perm["hookSpecificOutput"])
 
         return merged
+
+    # The keys of a PreToolUse permission decision in ``hookSpecificOutput``.
+    # These three are replaced as a UNIT so a decision from one source can never
+    # leave a stale field (e.g. a deny reason) from a different decision.
+    _PERMISSION_KEYS = (
+        "permissionDecision",
+        "permissionDecisionReason",
+        "updatedInput",
+    )
+
+    @classmethod
+    def _merge_permission_decision(
+        cls, merged: dict[str, Any], cut_perm: dict[str, Any]
+    ) -> None:
+        """Merge the can_use_tool permission decision into ``merged`` (W5).
+
+        Both a user ``PreToolUse`` hook and ``can_use_tool`` can produce a
+        permission decision. The two are independent permission gates, so the
+        merge rule is **deny from EITHER source wins**: an allow must NEVER
+        overwrite a deny, and a stale ``permissionDecisionReason`` from a
+        superseded decision must NEVER leak into the surviving one.
+
+        The permission triplet (``permissionDecision`` /
+        ``permissionDecisionReason`` / ``updatedInput``) is replaced as a UNIT,
+        so the surviving decision is always internally consistent. Non-permission
+        fields the user hook contributed to ``hookSpecificOutput`` are preserved.
+        """
+        hso = merged.get("hookSpecificOutput")
+        if not isinstance(hso, dict):
+            hso = {}
+            merged["hookSpecificOutput"] = hso
+
+        hook_decision = hso.get("permissionDecision")
+        cut_decision = cut_perm.get("permissionDecision")
+
+        # Deny wins: if the user hook already denied, keep its decision (do not
+        # let a can_use_tool allow overwrite it). Otherwise the can_use_tool
+        # decision applies (it is the authoritative permission gate when the hook
+        # did not itself deny, and a can_use_tool deny always overrides a hook
+        # allow / no-opinion).
+        if hook_decision == "deny" and cut_decision != "deny":
+            winner = {k: hso[k] for k in cls._PERMISSION_KEYS if k in hso}
+        else:
+            winner = {k: cut_perm[k] for k in cls._PERMISSION_KEYS if k in cut_perm}
+
+        # Replace the whole triplet atomically: drop any prior permission fields
+        # (so a stale reason/updatedInput from the losing decision cannot leak),
+        # then write the winner's fields. ``hookEventName`` and any other
+        # non-permission fields are left untouched.
+        for key in cls._PERMISSION_KEYS:
+            hso.pop(key, None)
+        hso.update(winner)
+        # The CLI keys the short-circuit off hookEventName; ensure it is present.
+        hso.setdefault("hookEventName", cut_perm.get("hookEventName", "PreToolUse"))
 
     def _matching_callbacks(
         self, event_name: Any, tool_name: Any
@@ -411,21 +481,57 @@ class HookIpcServer:
         if not isinstance(tool_use_id, str) or not tool_use_id:
             return await self._run_can_use_tool(event, tool_name, tool_use_id)
 
+        # Phase 1 (under lock): decide whether THIS dispatch owns the callback for
+        # this id, or whether it must wait for / replay an already-decided result.
+        # The lock is held ONLY for these dict ops -- never across the user
+        # callback -- so distinct ids never serialize behind one slow callback and
+        # a re-entrant callback cannot deadlock on the lock.
         async with self._cut_lock:
             cached = self._cut_decisions.get(tool_use_id)
             if cached is not None:
                 # Already decided for this exact tool call: replay (do NOT
                 # re-invoke the callback, and do NOT re-notify the transport).
                 return cached
+            inflight = self._cut_inflight.get(tool_use_id)
+            if inflight is not None:
+                # The callback for this id is already running on another dispatch;
+                # wait for it and replay its single result (no second invoke).
+                owner = False
+            else:
+                inflight = _CutInflight()
+                self._cut_inflight[tool_use_id] = inflight
+                owner = True
+
+        if not owner:
+            await inflight.done.wait()
+            return inflight.result
+
+        # Phase 2 (NO lock held): run the user callback. Distinct ids reach here
+        # concurrently. ``perm`` is pre-bound so the ``finally`` can always
+        # publish a result (None) and wake waiters even if the callback raised --
+        # ``_run_can_use_tool`` never raises today, but an unbound ``perm`` here
+        # would turn into an ``UnboundLocalError`` inside the ``finally`` that
+        # would leave ``inflight.done`` unset and hang every waiter for that id.
+        perm: dict[str, Any] | None = None
+        try:
             perm = await self._run_can_use_tool(event, tool_name, tool_use_id)
-            if perm is not None:
-                self._cut_decisions[tool_use_id] = perm
-                self._cut_order.append(tool_use_id)
-                # Bound the cache so a long session cannot grow it unboundedly.
-                if len(self._cut_order) > 512:
-                    evicted = self._cut_order.pop(0)
-                    self._cut_decisions.pop(evicted, None)
-            return perm
+        finally:
+            # Phase 3 (under lock): publish the result, retire the in-flight
+            # marker, and wake any waiters -- even if the callback raised
+            # (``_run_can_use_tool`` itself never raises, but stay defensive so a
+            # waiter can never hang).
+            async with self._cut_lock:
+                inflight.result = perm
+                self._cut_inflight.pop(tool_use_id, None)
+                if perm is not None:
+                    self._cut_decisions[tool_use_id] = perm
+                    self._cut_order.append(tool_use_id)
+                    # Bound the cache so a long session cannot grow it unboundedly.
+                    if len(self._cut_order) > 512:
+                        evicted = self._cut_order.pop(0)
+                        self._cut_decisions.pop(evicted, None)
+            inflight.done.set()
+        return perm
 
     async def _run_can_use_tool(
         self,
