@@ -288,6 +288,13 @@ class PtyCLITransport(Transport):
         self._drain_task: TaskHandle | None = None
         self._tail_task: TaskHandle | None = None
         self._question_task: TaskHandle | None = None
+        # Read end of the child's dedicated stderr pipe (H3). stdout stays on the
+        # PTY (the TUI needs a tty), but stderr is given a separate pipe so the
+        # ``options.stderr`` callback can receive the CLI's real stderr lines --
+        # matching the old stream-json transport's per-line behavior. ``None``
+        # when no stderr callback is configured (we then leave stderr on the PTY).
+        self._stderr_read_fd: int | None = None
+        self._stderr_task: TaskHandle | None = None
         # Fingerprints of questions already answered, so the watcher does not
         # re-answer the same on-screen dialog while it lingers before redraw.
         self._answered_questions: set[str] = set()
@@ -467,12 +474,24 @@ class PtyCLITransport(Transport):
         with contextlib.suppress(OSError):
             tty.setraw(slave_fd)
 
+        # H3: give the child a SEPARATE stderr pipe when a stderr callback is
+        # registered, so its stderr lines reach ``options.stderr`` (the old
+        # transport's behavior) instead of being muxed onto the PTY and lost.
+        # stdin/stdout stay on the slave PTY because the interactive TUI requires
+        # a tty. With no callback, leave stderr on the PTY (unchanged behavior).
+        stderr_write_fd: int | None = None
+        if self._options.stderr is not None:
+            r, w = os.pipe()
+            self._stderr_read_fd = r
+            stderr_write_fd = w
+        stderr_dest = stderr_write_fd if stderr_write_fd is not None else slave_fd
+
         try:
             self._proc = Popen(  # noqa: S603 - cmd is built from vetted options
                 cmd,
                 stdin=slave_fd,
                 stdout=slave_fd,
-                stderr=slave_fd,
+                stderr=stderr_dest,
                 # None => inherit parent's cwd (L2); only pin when caller set it.
                 cwd=self._spawn_cwd,
                 env=self._build_env(),
@@ -484,6 +503,7 @@ class PtyCLITransport(Transport):
         except FileNotFoundError as e:
             os.close(master_fd)
             os.close(slave_fd)
+            self._close_stderr_pipe(stderr_write_fd)
             if not Path(self._cwd).exists():
                 raise CLIConnectionError(
                     f"Working directory does not exist: {self._cwd}"
@@ -492,9 +512,15 @@ class PtyCLITransport(Transport):
         except Exception as e:
             os.close(master_fd)
             os.close(slave_fd)
+            self._close_stderr_pipe(stderr_write_fd)
             raise CLIConnectionError(f"Failed to start Claude Code: {e}") from e
 
         os.close(slave_fd)  # parent keeps only the master end
+        # The child owns the write end now; the parent only reads. Closing it
+        # here means the reader sees EOF when the child exits (no fd leak).
+        if stderr_write_fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(stderr_write_fd)
         self._master_fd = master_fd
         self._spawn_time = time.monotonic()
         _ACTIVE_CHILDREN.add(self)
@@ -525,6 +551,10 @@ class PtyCLITransport(Transport):
 
         self._drain_task = spawn_detached(self._drain_loop())
         self._tail_task = spawn_detached(self._tail_loop())
+        # H3: read the child's dedicated stderr pipe and invoke options.stderr
+        # per line (only spawned when the pipe was created, i.e. a callback set).
+        if self._stderr_read_fd is not None:
+            self._stderr_task = spawn_detached(self._stderr_loop())
         # Watch for blocking TUI permission/plan dialogs and answer them (C5/C6)
         # so turns complete. Only needed when there is something to decide with:
         # a can_use_tool callback, or default-mode prompts that would otherwise
@@ -712,11 +742,6 @@ class PtyCLITransport(Transport):
                 "CLI emits hook lifecycle events only on the stream-json stdout "
                 "channel, not into the transcript the PTY tails (verified "
                 "empirically -- no hook records appear in the transcript)."
-            )
-        if o.stderr is not None:
-            logger.warning(
-                "The stderr callback is not invoked by the interactive transport "
-                "(the CLI's stderr is multiplexed onto the PTY)."
             )
         if o.max_buffer_size is not None:
             logger.debug(
@@ -1086,6 +1111,63 @@ class PtyCLITransport(Transport):
             if self._question_stream is not None:
                 with contextlib.suppress(Exception):
                     self._question_stream.feed(data)
+
+    @staticmethod
+    def _close_stderr_pipe(write_fd: int | None) -> None:
+        """Close a half-opened stderr write end after a failed spawn (H3)."""
+        if write_fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(write_fd)
+
+    async def _stderr_loop(self) -> None:
+        """Read the child's dedicated stderr pipe and call options.stderr per line.
+
+        Mirrors the old stream-json transport's ``_handle_stderr``: split the
+        stream into lines, strip the trailing newline, skip blank lines, and
+        invoke ``options.stderr(line)`` for each, isolating a raising callback so
+        one bad line does not drop the rest of the session. Non-fatal: any read
+        error just ends the loop (the turn is unaffected -- stderr is purely
+        observability). The pipe fd is closed in ``close()``.
+        """
+        fd = self._stderr_read_fd
+        callback = self._options.stderr
+        if fd is None or callback is None:
+            return
+        buffer = b""
+        try:
+            while not self._closed:
+                try:
+                    data = await anyio.to_thread.run_sync(
+                        self._blocking_read, fd, abandon_on_cancel=True
+                    )
+                except anyio.get_cancelled_exc_class():
+                    raise
+                except Exception:
+                    break
+                if not data:
+                    break  # EOF: child closed its stderr / exited
+                buffer += data
+                *lines, buffer = buffer.split(b"\n")
+                for raw in lines:
+                    self._invoke_stderr(callback, raw)
+            # Flush any trailing partial line (no terminating newline).
+            if buffer.strip():
+                self._invoke_stderr(callback, buffer)
+        except anyio.get_cancelled_exc_class():
+            raise
+        except Exception:
+            logger.debug("stderr reader loop failed", exc_info=True)
+
+    @staticmethod
+    def _invoke_stderr(callback: Any, raw: bytes) -> None:
+        """Decode one stderr line and hand it to the user callback (isolated)."""
+        line = raw.decode("utf-8", "replace").rstrip()
+        if not line:
+            return
+        try:
+            callback(line)
+        except Exception:
+            logger.debug("stderr callback raised; continuing", exc_info=True)
 
     def _init_question_screen(self) -> None:
         """Create the pyte screen used by detect_question(), if pyte is present.
@@ -2462,7 +2544,12 @@ class PtyCLITransport(Transport):
         self._ready = False
         _ACTIVE_CHILDREN.discard(self)
 
-        for task in (self._tail_task, self._drain_task, self._question_task):
+        for task in (
+            self._tail_task,
+            self._drain_task,
+            self._question_task,
+            self._stderr_task,
+        ):
             if task is not None and not task.done():
                 task.cancel()
                 with contextlib.suppress(Exception):
@@ -2470,6 +2557,13 @@ class PtyCLITransport(Transport):
         self._tail_task = None
         self._drain_task = None
         self._question_task = None
+        self._stderr_task = None
+
+        # H3: close the read end of the child's stderr pipe (no fd leak).
+        if self._stderr_read_fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(self._stderr_read_fd)
+            self._stderr_read_fd = None
 
         # Stop the always-on API monitor (safe from any task -- it uses a
         # detached serve handle, not a task-affine cancel scope).

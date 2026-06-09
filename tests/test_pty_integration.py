@@ -63,6 +63,13 @@ if mode == "exit-error":
     sys.stderr.flush()
     sys.exit(3)
 
+if mode == "stderr":
+    # Write a couple of diagnostic lines to fd 2 before behaving like echo, so
+    # the transport's dedicated stderr pipe (H3) can deliver them to the
+    # options.stderr callback.
+    os.write(2, b"stderr line one\n")
+    os.write(2, b"stderr line two\n")
+
 path = os.environ["FAKE_TRANSCRIPT"]
 os.makedirs(os.path.dirname(path), exist_ok=True)
 
@@ -198,6 +205,29 @@ class TestQueryOneShot:
         results = [m for m in messages if isinstance(m, ResultMessage)]
         assert len(results) == 1
         assert results[0].is_error is True
+
+
+class TestStderrCallback:
+    @pytest.mark.anyio
+    async def test_stderr_lines_delivered_to_callback(self, monkeypatch, tmp_path):
+        """The child's stderr (on its own pipe, H3) reaches options.stderr per
+        line, while stdout stays on the PTY and the turn still completes."""
+        options = _setup(monkeypatch, tmp_path, mode="stderr")
+        lines: list[str] = []
+        options = replace(options, stderr=lines.append)
+
+        results = []
+        with anyio.fail_after(30):
+            async for msg in query(prompt="hi", options=options):
+                if isinstance(msg, ResultMessage):
+                    results.append(msg)
+
+        # The turn completed (stdout/transcript path still works)...
+        assert len(results) == 1
+        # ...and the child's stderr lines were delivered, in order, stripped.
+        assert "stderr line one" in lines
+        assert "stderr line two" in lines
+        assert lines.index("stderr line one") < lines.index("stderr line two")
 
 
 class TestStreamingClientMultiTurn:
