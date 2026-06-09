@@ -27,7 +27,7 @@ class TestIntegration:
         async def _test():
             with (
                 patch(
-                    "claude_agent_sdk._internal.client.SubprocessCLITransport"
+                    "claude_agent_sdk._internal.client.PtyCLITransport"
                 ) as mock_transport_class,
                 patch(
                     "claude_agent_sdk._internal.query.Query.initialize",
@@ -91,7 +91,7 @@ class TestIntegration:
         async def _test():
             with (
                 patch(
-                    "claude_agent_sdk._internal.client.SubprocessCLITransport"
+                    "claude_agent_sdk._internal.client.PtyCLITransport"
                 ) as mock_transport_class,
                 patch(
                     "claude_agent_sdk._internal.query.Query.initialize",
@@ -183,7 +183,7 @@ class TestIntegration:
         async def _test():
             with (
                 patch(
-                    "claude_agent_sdk._internal.client.SubprocessCLITransport"
+                    "claude_agent_sdk._internal.client.PtyCLITransport"
                 ) as mock_transport_class,
                 patch(
                     "claude_agent_sdk._internal.query.Query.initialize",
@@ -237,7 +237,7 @@ class TestIntegration:
         async def _test():
             with (
                 patch(
-                    "claude_agent_sdk._internal.client.SubprocessCLITransport"
+                    "claude_agent_sdk._internal.client.PtyCLITransport"
                 ) as mock_transport_class,
                 patch(
                     "claude_agent_sdk._internal.query.Query.initialize",

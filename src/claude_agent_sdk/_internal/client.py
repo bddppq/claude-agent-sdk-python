@@ -22,7 +22,7 @@ from .session_resume import (
 )
 from .session_store_validation import validate_session_store_options
 from .transport import Transport
-from .transport.subprocess_cli import SubprocessCLITransport
+from .transport.pty_cli import PtyCLITransport
 
 
 class InternalClient:
@@ -124,7 +124,7 @@ class InternalClient:
         if transport is not None:
             chosen_transport = transport
         else:
-            chosen_transport = SubprocessCLITransport(
+            chosen_transport = PtyCLITransport(
                 prompt=prompt,
                 options=configured_options,
             )

@@ -189,9 +189,7 @@ class TestStringPromptWithSdkMcpServers:
             mock_transport.end_input = tracking_end_input
 
             with (
-                patch(
-                    "claude_agent_sdk._internal.client.SubprocessCLITransport"
-                ) as mock_cls,
+                patch("claude_agent_sdk._internal.client.PtyCLITransport") as mock_cls,
                 patch(
                     "claude_agent_sdk._internal.query.Query.initialize",
                     new_callable=AsyncMock,
@@ -229,9 +227,7 @@ class TestStringPromptWithSdkMcpServers:
             mock_transport = _make_mock_transport(messages=_ASSISTANT_AND_RESULT)
 
             with (
-                patch(
-                    "claude_agent_sdk._internal.client.SubprocessCLITransport"
-                ) as mock_cls,
+                patch("claude_agent_sdk._internal.client.PtyCLITransport") as mock_cls,
                 patch(
                     "claude_agent_sdk._internal.query.Query.initialize",
                     new_callable=AsyncMock,
@@ -276,9 +272,7 @@ class TestStringPromptWithSdkMcpServers:
             mock_transport.read_messages = mock_receive
 
             with (
-                patch(
-                    "claude_agent_sdk._internal.client.SubprocessCLITransport"
-                ) as mock_cls,
+                patch("claude_agent_sdk._internal.client.PtyCLITransport") as mock_cls,
                 patch(
                     "claude_agent_sdk._internal.query.Query.initialize",
                     new_callable=AsyncMock,
@@ -331,9 +325,7 @@ class TestStringPromptWithSdkMcpServers:
                 return {"continue_": True}
 
             with (
-                patch(
-                    "claude_agent_sdk._internal.client.SubprocessCLITransport"
-                ) as mock_cls,
+                patch("claude_agent_sdk._internal.client.PtyCLITransport") as mock_cls,
                 patch(
                     "claude_agent_sdk._internal.query.Query.initialize",
                     new_callable=AsyncMock,
@@ -391,9 +383,7 @@ class TestAsyncIterablePromptWithSdkMcpServers:
                 }
 
             with (
-                patch(
-                    "claude_agent_sdk._internal.client.SubprocessCLITransport"
-                ) as mock_cls,
+                patch("claude_agent_sdk._internal.client.PtyCLITransport") as mock_cls,
                 patch(
                     "claude_agent_sdk._internal.query.Query.initialize",
                     new_callable=AsyncMock,
@@ -457,9 +447,7 @@ class TestAsyncIterablePromptWithSdkMcpServers:
                 }
 
             with (
-                patch(
-                    "claude_agent_sdk._internal.client.SubprocessCLITransport"
-                ) as mock_cls,
+                patch("claude_agent_sdk._internal.client.PtyCLITransport") as mock_cls,
                 patch(
                     "claude_agent_sdk._internal.query.Query.initialize",
                     new_callable=AsyncMock,

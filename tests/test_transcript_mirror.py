@@ -33,7 +33,6 @@ from claude_agent_sdk._internal.transcript_mirror_batcher import (
     MAX_PENDING_ENTRIES,
     TranscriptMirrorBatcher,
 )
-from claude_agent_sdk._internal.transport.subprocess_cli import SubprocessCLITransport
 
 # ---------------------------------------------------------------------------
 # file_path_to_session_key
@@ -577,31 +576,6 @@ class TestBuildMirrorBatcherFlushMode:
 
 
 # ---------------------------------------------------------------------------
-# --session-mirror CLI flag
-# ---------------------------------------------------------------------------
-
-
-class TestSessionMirrorFlag:
-    def test_flag_present_when_session_store_set(self) -> None:
-        transport = SubprocessCLITransport(
-            prompt="hi",
-            options=ClaudeAgentOptions(
-                cli_path="/usr/bin/claude", session_store=InMemorySessionStore()
-            ),
-        )
-        cmd = transport._build_command()
-        assert "--session-mirror" in cmd
-
-    def test_flag_absent_when_session_store_unset(self) -> None:
-        transport = SubprocessCLITransport(
-            prompt="hi",
-            options=ClaudeAgentOptions(cli_path="/usr/bin/claude"),
-        )
-        cmd = transport._build_command()
-        assert "--session-mirror" not in cmd
-
-
-# ---------------------------------------------------------------------------
 # Receive-loop integration: frame peeling, flush-before-result, mirror_error
 # ---------------------------------------------------------------------------
 
@@ -665,9 +639,7 @@ class TestReceiveLoopFramePeeling:
             )
 
             with (
-                patch(
-                    "claude_agent_sdk._internal.client.SubprocessCLITransport"
-                ) as mock_cls,
+                patch("claude_agent_sdk._internal.client.PtyCLITransport") as mock_cls,
                 patch(
                     "claude_agent_sdk._internal.query.Query.initialize",
                     new_callable=AsyncMock,
@@ -718,9 +690,7 @@ class TestReceiveLoopFramePeeling:
             )
 
             with (
-                patch(
-                    "claude_agent_sdk._internal.client.SubprocessCLITransport"
-                ) as mock_cls,
+                patch("claude_agent_sdk._internal.client.PtyCLITransport") as mock_cls,
                 patch(
                     "claude_agent_sdk._internal.query.Query.initialize",
                     new_callable=AsyncMock,
@@ -761,9 +731,7 @@ class TestReceiveLoopFramePeeling:
                 ]
             )
             with (
-                patch(
-                    "claude_agent_sdk._internal.client.SubprocessCLITransport"
-                ) as mock_cls,
+                patch("claude_agent_sdk._internal.client.PtyCLITransport") as mock_cls,
                 patch(
                     "claude_agent_sdk._internal.query.Query.initialize",
                     new_callable=AsyncMock,
@@ -819,9 +787,7 @@ class TestReceiveLoopFramePeeling:
             )
 
             with (
-                patch(
-                    "claude_agent_sdk._internal.client.SubprocessCLITransport"
-                ) as mock_cls,
+                patch("claude_agent_sdk._internal.client.PtyCLITransport") as mock_cls,
                 patch(
                     "claude_agent_sdk._internal.query.Query.initialize",
                     new_callable=AsyncMock,
@@ -869,9 +835,7 @@ class TestReceiveLoopFramePeeling:
                 ]
             )
             with (
-                patch(
-                    "claude_agent_sdk._internal.client.SubprocessCLITransport"
-                ) as mock_cls,
+                patch("claude_agent_sdk._internal.client.PtyCLITransport") as mock_cls,
                 patch(
                     "claude_agent_sdk._internal.query.Query.initialize",
                     new_callable=AsyncMock,
@@ -905,9 +869,7 @@ class TestReceiveLoopFramePeeling:
                 ]
             )
             with (
-                patch(
-                    "claude_agent_sdk._internal.client.SubprocessCLITransport"
-                ) as mock_cls,
+                patch("claude_agent_sdk._internal.client.PtyCLITransport") as mock_cls,
                 patch(
                     "claude_agent_sdk._internal.query.Query.initialize",
                     new_callable=AsyncMock,

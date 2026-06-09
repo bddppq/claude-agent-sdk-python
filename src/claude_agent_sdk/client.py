@@ -154,7 +154,7 @@ class ClaudeSDKClient:
             apply_materialized_options,
             build_mirror_batcher,
         )
-        from ._internal.transport.subprocess_cli import SubprocessCLITransport
+        from ._internal.transport.pty_cli import PtyCLITransport
 
         # Validate and configure permission settings (matching TypeScript SDK logic)
         if self.options.can_use_tool:
@@ -184,7 +184,7 @@ class ClaudeSDKClient:
         if self._custom_transport:
             self._transport = self._custom_transport
         else:
-            self._transport = SubprocessCLITransport(
+            self._transport = PtyCLITransport(
                 prompt=actual_prompt,
                 options=options,
             )
@@ -546,6 +546,17 @@ class ClaudeSDKClient:
         - Available commands (slash commands, system commands, etc.)
         - Current and available output styles
         - Server capabilities
+        - The live tool catalog and model (``tools`` / ``models`` / ``model``)
+
+        This re-issues the ``initialize`` control request so the result reflects the
+        current session state rather than the connect-time snapshot.
+
+        Note (PTY/relay transport limitation): with the interactive PTY transport the
+        tool catalog and model are derived from observed ``/v1/messages`` traffic, so
+        they only become populated after the first turn. Calling this before any turn
+        (immediately after connect, pre-traffic) may return ``tools=[]`` and an empty
+        ``model`` — connect-time init is options-derived. After the first turn the
+        catalog/model are populated.
 
         Returns:
             Dictionary with server info, or None if not in streaming mode
@@ -561,8 +572,19 @@ class ClaudeSDKClient:
         """
         if not self._query:
             raise CLIConnectionError("Not connected. Call connect() first.")
-        # Return the initialization result that was already obtained during connect
-        return getattr(self._query, "_initialization_result", None)
+        # Re-issue the `initialize` control request so the returned catalog/model
+        # reflect live session state (e.g. tools/model observed from traffic by the
+        # PTY transport) rather than the stale connect-time snapshot. initialize()
+        # re-caches the fresh response into _initialization_result. Fall back to the
+        # cached snapshot if a refresh fails (e.g. transport mid-teardown).
+        try:
+            result: dict[str, Any] | None = await self._query.initialize()
+            return result
+        except Exception:
+            cached: dict[str, Any] | None = getattr(
+                self._query, "_initialization_result", None
+            )
+            return cached
 
     async def receive_response(self) -> AsyncIterator[Message]:
         """

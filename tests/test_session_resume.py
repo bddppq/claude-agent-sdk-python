@@ -27,7 +27,7 @@ from claude_agent_sdk._internal.session_resume import (
     materialize_resume_session,
 )
 from claude_agent_sdk._internal.session_store import project_key_for_directory
-from claude_agent_sdk._internal.transport.subprocess_cli import SubprocessCLITransport
+from claude_agent_sdk._internal.transport.pty_cli import PtyCLITransport
 from claude_agent_sdk.types import SessionKey, SessionStore, SessionStoreEntry
 
 SESSION_ID = "550e8400-e29b-41d4-a716-446655440000"
@@ -768,8 +768,7 @@ class TestClientIntegration:
 
         with (
             patch(
-                "claude_agent_sdk._internal.transport.subprocess_cli."
-                "SubprocessCLITransport",
+                "claude_agent_sdk._internal.transport.pty_cli.PtyCLITransport",
                 side_effect=capture_transport,
             ),
             patch(
@@ -792,9 +791,7 @@ class TestClientIntegration:
 
         # Build the actual CLI command (real class, outside the patch) to
         # assert exact flag behavior.
-        cmd = SubprocessCLITransport(
-            prompt="x", options=transport_opts
-        )._build_command()
+        cmd = PtyCLITransport(prompt="x", options=transport_opts)._build_command()
         assert "--resume" in cmd
         assert cmd[cmd.index("--resume") + 1] == SESSION_ID
         assert "--continue" not in cmd
@@ -906,8 +903,7 @@ class TestClientIntegration:
 
         with (
             patch(
-                "claude_agent_sdk._internal.transport.subprocess_cli."
-                "SubprocessCLITransport",
+                "claude_agent_sdk._internal.transport.pty_cli.PtyCLITransport",
                 side_effect=capture_transport,
             ),
             patch(
@@ -1047,8 +1043,7 @@ class TestSpawnFailureCleanup:
 
         with (
             patch(
-                "claude_agent_sdk._internal.transport.subprocess_cli."
-                "SubprocessCLITransport",
+                "claude_agent_sdk._internal.transport.pty_cli.PtyCLITransport",
                 return_value=mock_transport,
             ),
             pytest.raises(OSError, match="spawn failed"),
@@ -1081,8 +1076,7 @@ class TestSpawnFailureCleanup:
 
         with (
             patch(
-                "claude_agent_sdk._internal.transport.subprocess_cli."
-                "SubprocessCLITransport",
+                "claude_agent_sdk._internal.transport.pty_cli.PtyCLITransport",
                 return_value=mock_transport,
             ),
             pytest.raises(OSError, match="spawn failed"),
@@ -1120,8 +1114,7 @@ class TestSpawnFailureCleanup:
 
         with (
             patch(
-                "claude_agent_sdk._internal.transport.subprocess_cli."
-                "SubprocessCLITransport",
+                "claude_agent_sdk._internal.transport.pty_cli.PtyCLITransport",
                 return_value=mock_transport,
             ),
             patch(
@@ -1189,8 +1182,7 @@ class TestSpawnFailureCleanup:
             connect_returned = True  # unreachable if cleanup re-raises
 
         with patch(
-            "claude_agent_sdk._internal.transport.subprocess_cli."
-            "SubprocessCLITransport",
+            "claude_agent_sdk._internal.transport.pty_cli.PtyCLITransport",
             side_effect=fake_transport,
         ):
             with anyio.fail_after(2):
@@ -1227,7 +1219,7 @@ class TestSpawnFailureCleanup:
 
         with (
             patch(
-                "claude_agent_sdk._internal.client.SubprocessCLITransport",
+                "claude_agent_sdk._internal.client.PtyCLITransport",
                 return_value=mock_transport,
             ),
             pytest.raises(OSError, match="spawn failed"),
@@ -1291,7 +1283,7 @@ class TestSpawnFailureCleanup:
 
         with (
             patch(
-                "claude_agent_sdk._internal.client.SubprocessCLITransport",
+                "claude_agent_sdk._internal.client.PtyCLITransport",
                 return_value=mock_transport,
             ),
             patch(

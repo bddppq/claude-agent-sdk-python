@@ -35,12 +35,10 @@ These tests confirm:
 """
 
 import os
-from unittest.mock import AsyncMock, MagicMock, patch
-
-import anyio
+from unittest.mock import patch
 
 from claude_agent_sdk._internal.message_parser import parse_message
-from claude_agent_sdk._internal.transport.subprocess_cli import SubprocessCLITransport
+from claude_agent_sdk._internal.transport.pty_cli import PtyCLITransport
 from claude_agent_sdk.types import ClaudeAgentOptions, ToolResultBlock, UserMessage
 
 DEFAULT_CLI_PATH = "/usr/bin/claude"
@@ -49,13 +47,13 @@ DEFAULT_CLI_PATH = "/usr/bin/claude"
 _LAYER2_THRESHOLD_CHARS = 50_000
 
 
-def make_transport(env: dict | None = None, **kwargs) -> SubprocessCLITransport:
+def make_transport(env: dict | None = None, **kwargs) -> PtyCLITransport:
     options = ClaudeAgentOptions(
         cli_path=DEFAULT_CLI_PATH,
         env=env or {},
         **kwargs,
     )
-    return SubprocessCLITransport(prompt="test", options=options)
+    return PtyCLITransport(prompt="test", options=options)
 
 
 # ---------------------------------------------------------------------------
@@ -63,34 +61,9 @@ def make_transport(env: dict | None = None, **kwargs) -> SubprocessCLITransport:
 # ---------------------------------------------------------------------------
 
 
-def _capture_env(transport: SubprocessCLITransport) -> dict[str, str]:
-    """Run transport.connect() with a mocked process and return the env dict."""
-    captured: dict[str, str] = {}
-
-    async def _run():
-        mock_process = MagicMock()
-        mock_process.stdin = MagicMock()
-        mock_process.stdout = MagicMock()
-        mock_process.stderr = None
-        mock_process.returncode = None
-
-        with (
-            patch(
-                "claude_agent_sdk._internal.transport.subprocess_cli.anyio.open_process",
-                new_callable=AsyncMock,
-                return_value=mock_process,
-            ) as mock_open,
-            patch(
-                "claude_agent_sdk._internal.transport.subprocess_cli.SubprocessCLITransport._check_claude_version",
-                new_callable=AsyncMock,
-            ),
-        ):
-            await transport.connect()
-            _, kwargs = mock_open.call_args
-            captured.update(kwargs.get("env", {}))
-
-    anyio.run(_run)
-    return captured
+def _capture_env(transport: PtyCLITransport) -> dict[str, str]:
+    """Return the environment the transport would pass to the CLI subprocess."""
+    return transport._build_env()
 
 
 # ---------------------------------------------------------------------------
