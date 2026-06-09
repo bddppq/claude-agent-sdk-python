@@ -85,6 +85,12 @@ class DetectedQuestion:
     # ``AskUserQuestion`` renders a tabbed multi-question form; ``headers`` holds
     # the per-question tab labels (only the active tab's options are on screen).
     headers: list[str] = field(default_factory=list)
+    # True only for the "Bypass Permissions mode" startup confirmation
+    # (``kind == "app_dialog"``). The transport auto-accepts this one so a
+    # ``permission_mode="bypassPermissions"`` session does not hang on it (#10);
+    # other app_dialogs (e.g. folder-trust) are left alone -- trust is handled by
+    # pre-seeding the config, and unknown app dialogs need real user input.
+    is_bypass: bool = False
 
 
 def reconstruct(
@@ -298,6 +304,7 @@ def parse_question(lines: list[str]) -> DetectedQuestion | None:
         target=target,
         preview=preview,
         headers=headers,
+        is_bypass=(kind == "app_dialog" and "bypasspermissionsmode" in normalized),
     )
 
 

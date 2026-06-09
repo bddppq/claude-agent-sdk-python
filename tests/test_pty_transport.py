@@ -240,6 +240,108 @@ class TestBuildEnv:
 
 
 # --------------------------------------------------------------------------- #
+# Config-dir isolation (L4): never write the user's real ~/.claude.json
+# --------------------------------------------------------------------------- #
+
+
+class TestConfigDirIsolation:
+    def _isolate_home(self, monkeypatch, tmp_path):
+        """Point HOME + XDG_CACHE_HOME at tmp dirs and clear CLAUDE_CONFIG_DIR."""
+        home = tmp_path / "home"
+        home.mkdir()
+        cache = tmp_path / "cache"
+        cache.mkdir()
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setenv("XDG_CACHE_HOME", str(cache))
+        monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+        return home, cache
+
+    def test_defaults_config_dir_to_persistent_sdk_cache(self, monkeypatch, tmp_path):
+        _, cache = self._isolate_home(monkeypatch, tmp_path)
+        t = make_transport()
+        t._resolve_config_dir()
+        expected = str(cache / "claude-agent-sdk" / "config")
+        assert t._effective_env["CLAUDE_CONFIG_DIR"] == expected
+        assert (cache / "claude-agent-sdk" / "config").is_dir()
+        # The child env carries it too.
+        assert t._build_env()["CLAUDE_CONFIG_DIR"] == expected
+
+    def test_falls_back_to_dot_cache_without_xdg(self, monkeypatch, tmp_path):
+        home, _ = self._isolate_home(monkeypatch, tmp_path)
+        monkeypatch.delenv("XDG_CACHE_HOME", raising=False)
+        t = make_transport()
+        t._resolve_config_dir()
+        expected = str(home / ".cache" / "claude-agent-sdk" / "config")
+        assert t._effective_env["CLAUDE_CONFIG_DIR"] == expected
+
+    def test_seeds_from_user_config_carrying_auth(self, monkeypatch, tmp_path):
+        home, cache = self._isolate_home(monkeypatch, tmp_path)
+        user_cfg = home / ".claude.json"
+        user_cfg.write_text(json.dumps({"oauthAccount": {"token": "secret"}}))
+
+        t = make_transport()
+        t._resolve_config_dir()
+
+        sdk_cfg = cache / "claude-agent-sdk" / "config" / ".claude.json"
+        assert sdk_cfg.exists()
+        # Auth/login state carried over into the SDK copy.
+        assert json.loads(sdk_cfg.read_text())["oauthAccount"]["token"] == "secret"
+
+    def test_user_config_untouched_after_connect_flow(self, monkeypatch, tmp_path):
+        """Resolving + onboarding writes the SDK copy, never the user's file."""
+        home, cache = self._isolate_home(monkeypatch, tmp_path)
+        user_cfg = home / ".claude.json"
+        user_cfg.write_text(json.dumps({"oauthAccount": {"token": "secret"}}))
+        before = user_cfg.read_text()
+
+        t = make_transport(cwd=str(tmp_path))
+        t._resolve_config_dir()
+        # Onboarding flags must land in the SDK copy, not the user's file.
+        t._ensure_onboarding_complete()
+
+        assert user_cfg.read_text() == before
+        sdk_cfg = cache / "claude-agent-sdk" / "config" / ".claude.json"
+        sdk_data = json.loads(sdk_cfg.read_text())
+        assert sdk_data["hasCompletedOnboarding"] is True
+        # And auth survived the seeding.
+        assert sdk_data["oauthAccount"]["token"] == "secret"
+
+    def test_respects_caller_supplied_config_dir(self, monkeypatch, tmp_path):
+        self._isolate_home(monkeypatch, tmp_path)
+        caller_dir = str(tmp_path / "caller_cfg")
+        t = make_transport(env={"CLAUDE_CONFIG_DIR": caller_dir})
+        t._resolve_config_dir()
+        # Unchanged: no SDK default injected over the caller's explicit choice.
+        assert t._effective_env["CLAUDE_CONFIG_DIR"] == caller_dir
+        # And no SDK cache dir was created.
+        assert not (tmp_path / "cache" / "claude-agent-sdk").exists()
+
+    def test_respects_env_supplied_config_dir(self, monkeypatch, tmp_path):
+        self._isolate_home(monkeypatch, tmp_path)
+        env_dir = str(tmp_path / "env_cfg")
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", env_dir)
+        t = make_transport()
+        t._resolve_config_dir()
+        # We leave _effective_env alone; resolution finds the env value via
+        # os.environ (sessions._get_projects_dir consults it).
+        assert "CLAUDE_CONFIG_DIR" not in t._effective_env
+
+    def test_seeds_only_once_preserving_refreshed_state(self, monkeypatch, tmp_path):
+        """A pre-existing SDK copy is NOT clobbered by the user's file (login
+        the CLI refreshed into the SDK copy must persist across runs)."""
+        home, cache = self._isolate_home(monkeypatch, tmp_path)
+        (home / ".claude.json").write_text(json.dumps({"v": "user"}))
+        sdk_dir = cache / "claude-agent-sdk" / "config"
+        sdk_dir.mkdir(parents=True)
+        (sdk_dir / ".claude.json").write_text(json.dumps({"v": "refreshed"}))
+
+        t = make_transport()
+        t._resolve_config_dir()
+
+        assert json.loads((sdk_dir / ".claude.json").read_text())["v"] == "refreshed"
+
+
+# --------------------------------------------------------------------------- #
 # Transport interface behavior (no real subprocess)
 # --------------------------------------------------------------------------- #
 
@@ -1024,6 +1126,52 @@ class TestPermissionAnswering:
                 kind="ask",
                 question="Which?",
                 options=[QuestionOption(index=1, label="A")],
+            )
+            assert await t._answer_question(q) is False
+
+        anyio.run(_test)
+
+    def test_bypass_dialog_is_auto_accepted(self):
+        # #10: the bypassPermissions startup dialog is auto-accepted (option 2 =
+        # "Yes, I accept") so the session does not hang.
+        async def _test():
+            from claude_agent_sdk._internal.transport.pty_question import (
+                DetectedQuestion,
+                QuestionOption,
+            )
+
+            t = make_transport(permission_mode="bypassPermissions")
+            writes = _capture_pty_writes(t)
+            q = DetectedQuestion(
+                kind="app_dialog",
+                question="Bypass Permissions mode",
+                options=[
+                    QuestionOption(index=1, label="No, exit", action="deny"),
+                    QuestionOption(index=2, label="Yes, I accept", action="allow_once"),
+                ],
+                is_bypass=True,
+            )
+            assert await t._answer_question(q) is True
+            joined = b"".join(writes)
+            assert b"2" in joined and writes[-1] == b"\r"
+
+        anyio.run(_test)
+
+    def test_non_bypass_app_dialog_not_auto_answered(self):
+        # A folder-trust (or other) app_dialog is NOT auto-answered (trust is
+        # handled by config pre-seeding; unknown dialogs need real input).
+        async def _test():
+            from claude_agent_sdk._internal.transport.pty_question import (
+                DetectedQuestion,
+                QuestionOption,
+            )
+
+            t = make_transport()
+            q = DetectedQuestion(
+                kind="app_dialog",
+                question="Do you trust the files in this folder?",
+                options=[QuestionOption(index=1, label="Yes", action="allow_once")],
+                is_bypass=False,
             )
             assert await t._answer_question(q) is False
 

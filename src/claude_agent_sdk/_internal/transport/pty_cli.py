@@ -43,6 +43,7 @@ import logging
 import os
 import pty
 import re
+import shutil
 import signal
 import struct
 import tempfile
@@ -274,6 +275,16 @@ class PtyCLITransport(Transport):
         # many shift+tab cycles are needed to reach a target.
         self._permission_mode: str = options.permission_mode or "default"
 
+        # Effective env override consulted by env construction AND transcript
+        # path resolution (L4). It starts as the caller's options.env and may be
+        # augmented in connect() with an SDK-owned ``CLAUDE_CONFIG_DIR`` default
+        # so the child never writes the user's real ~/.claude.json. Both the
+        # child env (_build_env) and every transcript-path lookup read THIS dict,
+        # so the config dir stays internally consistent (transcript tailing finds
+        # the session .jsonl under the same dir the child writes to). We copy so
+        # we never mutate the caller's ClaudeAgentOptions.env in place.
+        self._effective_env: dict[str, str] = dict(options.env)
+
         self._proc: Popen[bytes] | None = None
         self._master_fd: int | None = None
         self._transcript_path: Path | None = None
@@ -443,6 +454,12 @@ class PtyCLITransport(Transport):
             return
 
         self._validate_options()
+
+        # L4: isolate config writes to an SDK-owned dir (seeded from the user's
+        # real config so auth/login survive) so the child never mutates the
+        # user's ~/.claude.json. Must run before onboarding (which writes the
+        # trust/onboarding flags) and before _build_env / transcript resolution.
+        await anyio.to_thread.run_sync(self._resolve_config_dir)
 
         if self._cli_path is None:
             self._cli_path = await anyio.to_thread.run_sync(_cli_command.find_cli)
@@ -754,6 +771,14 @@ class PtyCLITransport(Transport):
         # Use the same entrypoint tag as the stream-json baseline so telemetry
         # is not keyed differently for drop-in consumers (E1).
         env = _cli_command.build_env(self._options, self._cwd, entrypoint="sdk-py")
+        # L4: route the child at the SDK-owned config dir resolved in connect()
+        # (only set when the caller/env did NOT pin CLAUDE_CONFIG_DIR), so the
+        # child writes its onboarding/trust/login state there, never into the
+        # user's real ~/.claude.json. build_env already merged options.env, so an
+        # explicit caller value is preserved (we only add the SDK default).
+        sdk_config_dir = self._effective_env.get("CLAUDE_CONFIG_DIR")
+        if sdk_config_dir and "CLAUDE_CONFIG_DIR" not in self._options.env:
+            env["CLAUDE_CONFIG_DIR"] = sdk_config_dir
         # Always-on API monitor: point the CHILD CLI at the loopback proxy so its
         # /v1/messages traffic is observed (and forwarded UNCHANGED to the real
         # upstream the proxy captured from the original ANTHROPIC_BASE_URL). The
@@ -913,6 +938,54 @@ class PtyCLITransport(Transport):
             ):
                 self._out_send.send_nowait(message)
 
+    def _resolve_config_dir(self) -> None:
+        """Default ``CLAUDE_CONFIG_DIR`` to an SDK-owned dir, seeded from the user's
+        real config, so connecting never writes the user's ~/.claude.json (L4).
+
+        The CLI persists OAuth/login state and settings in ``~/.claude.json`` and
+        writes onboarding/trust flags there. The old transport ran the CLI
+        directly against the user's home, so a drop-in must not silently corrupt
+        or churn that file. We instead point the child at a **persistent**,
+        per-user SDK cache dir (not a throwaway-per-connect dir, so login state
+        persists across runs) and seed it once from the user's real config so
+        auth + settings carry over. ``_ensure_onboarding_complete`` then writes
+        the flags into the SDK copy, leaving the user's file untouched.
+
+        No-op when the caller or environment already set ``CLAUDE_CONFIG_DIR`` --
+        that is an explicit choice we respect unchanged.
+        """
+        if self._effective_env.get("CLAUDE_CONFIG_DIR") or os.environ.get(
+            "CLAUDE_CONFIG_DIR"
+        ):
+            return  # caller/env pinned it; respect their choice
+
+        # Persistent per-user SDK cache dir. $XDG_CACHE_HOME wins (per the XDG
+        # base-dir spec), else ~/.cache. Stable path => login persists across
+        # runs (NOT a throwaway tempdir).
+        cache_root = os.environ.get("XDG_CACHE_HOME") or str(Path.home() / ".cache")
+        sdk_config_dir = Path(cache_root) / "claude-agent-sdk" / "config"
+        try:
+            sdk_config_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            # Cannot create the isolated dir -- fall back to the prior behavior
+            # (child uses the user's home). Better a working turn than a crash.
+            logger.debug("Could not create SDK config dir; using default home")
+            return
+
+        # Seed auth + settings from the user's real ~/.claude.json the FIRST time
+        # only (best-effort). Once seeded, the SDK copy is the source of truth and
+        # the user's file is never read/written again, so subsequent runs keep
+        # whatever login state the CLI refreshed into the SDK copy.
+        sdk_config_file = sdk_config_dir / ".claude.json"
+        if not sdk_config_file.exists():
+            user_config = Path.home() / ".claude.json"
+            if user_config.exists():
+                with contextlib.suppress(OSError):
+                    shutil.copy2(user_config, sdk_config_file)
+
+        # Route the child + transcript resolution + onboarding at the SDK dir.
+        self._effective_env["CLAUDE_CONFIG_DIR"] = str(sdk_config_dir)
+
     def _ensure_onboarding_complete(self) -> None:
         """Clear interactive gates that would block programmatic input.
 
@@ -928,7 +1001,11 @@ class PtyCLITransport(Transport):
         Pre-seeding the config is more robust than timing blind keystrokes
         against a full-screen TUI.
         """
-        config_dir = self._options.env.get("CLAUDE_CONFIG_DIR") or os.environ.get(
+        # Use the resolved effective config dir (the SDK-owned dir when we
+        # defaulted it in _resolve_config_dir; the caller's value otherwise), so
+        # the flags land in the SAME file the child reads -- and never in the
+        # user's real ~/.claude.json once isolation is active (L4).
+        config_dir = self._effective_env.get("CLAUDE_CONFIG_DIR") or os.environ.get(
             "CLAUDE_CONFIG_DIR"
         )
         config_path = (
@@ -988,7 +1065,7 @@ class PtyCLITransport(Transport):
 
     def _compute_transcript_path(self) -> Path:
         project_dir = _get_projects_dir(
-            env_override=self._options.env
+            env_override=self._effective_env
         ) / _sanitize_path(_canonicalize_path(self._cwd))
         # The CLI writes/extends the transcript under the id it actually uses.
         # For an explicit/auto session id that is ``self._session_id``; for a
@@ -1058,7 +1135,7 @@ class PtyCLITransport(Transport):
         if self._transcript_path and self._transcript_path.exists():
             return self._transcript_path
 
-        projects = _get_projects_dir(env_override=self._options.env)
+        projects = _get_projects_dir(env_override=self._effective_env)
         fname = f"{self._session_id}.jsonl"
         with contextlib.suppress(OSError):
             for p in projects.rglob(fname):
@@ -1243,7 +1320,17 @@ class PtyCLITransport(Transport):
         app-level dialogs need real user/content input that the SDK consumer must
         supply, so they are left for the caller (and would otherwise have been
         un-answerable over stream-json too).
+
+        Exception (#10): the "Bypass Permissions mode" startup confirmation that
+        ``permission_mode="bypassPermissions"`` triggers IS auto-accepted -- it is
+        a fixed yes/no acknowledgement the caller already implied by choosing that
+        mode, and leaving it unanswered hangs the session forever. (When running
+        as root it never appears, suppressed by IS_SANDBOX=1; this covers the
+        non-root case.)
         """
+        if question.is_bypass:
+            return await self._accept_bypass_dialog(question)
+
         if question.kind not in ("permission", "plan"):
             return False
 
@@ -1267,6 +1354,23 @@ class PtyCLITransport(Transport):
             # Mark the turn as deny-terminated so _emit_line synthesizes a
             # terminating result once the rejected tool_result lands.
             self._deny_terminated = True
+        return True
+
+    async def _accept_bypass_dialog(self, question: DetectedQuestion) -> bool:
+        """Press the "Yes, I accept" option on the bypass-permissions dialog (#10).
+
+        The dialog renders two numbered options: "No, exit" (action ``deny``) and
+        "Yes, I accept" (action ``allow_once``). We pick the accept option so the
+        ``bypassPermissions`` session proceeds. Returns True if an accept option
+        was found and sent.
+        """
+        accept = next(
+            (o for o in question.options if o.action == "allow_once"),
+            None,
+        )
+        if accept is None:
+            return False
+        await self._send_option_choice(accept)
         return True
 
     async def _decide_permission(

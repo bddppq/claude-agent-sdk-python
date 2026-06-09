@@ -163,12 +163,33 @@ def test_ask_user_question() -> None:
     assert selectable[0].description == "Use Python for the implementation."
 
 
+TRUST_DIALOG_FRAME = [
+    "Do you trust the files in this folder?",
+    "/home/user/project",
+    "> 1. Yes, proceed",
+    "  2. No, exit",
+    "Enter to confirm · Esc to cancel",
+]
+
+
 def test_app_dialog() -> None:
     q = parse_question(APP_DIALOG_FRAME)
     assert q is not None
     assert q.kind == "app_dialog"
     assert q.options[0].action == "deny"  # "No, exit"
     assert q.options[1].action == "allow_once"  # "Yes, I accept"
+    # #10: the bypass-permissions startup dialog is flagged so the transport
+    # auto-accepts it.
+    assert q.is_bypass is True
+
+
+def test_trust_app_dialog_is_not_flagged_bypass() -> None:
+    # The folder-trust dialog is app_dialog too, but is NOT a bypass dialog
+    # (it is handled by config pre-seeding, not auto-accept).
+    q = parse_question(TRUST_DIALOG_FRAME)
+    assert q is not None
+    assert q.kind == "app_dialog"
+    assert q.is_bypass is False
 
 
 def test_generation_is_not_a_question() -> None:
