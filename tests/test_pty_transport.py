@@ -14,6 +14,7 @@ import pytest
 
 from claude_agent_sdk._internal.transport import pty_cli
 from claude_agent_sdk._internal.transport.pty_cli import (
+    _INTERRUPT,
     _SHIFT_TAB,
     PtyCLITransport,
     _sanitize_assistant_message,
@@ -820,7 +821,7 @@ class TestControlMappings:
 
     @pytest.mark.parametrize(
         "subtype",
-        ["rewind_files", "stop_task", "mcp_toggle"],
+        ["rewind_files", "mcp_reconnect", "mcp_toggle"],
     )
     def test_unsupported_controls_return_error(self, subtype):
         async def _test():
@@ -3659,3 +3660,392 @@ class TestBackgroundTaskHold:
             }
         )
         assert t._pending_tasks == set()
+
+
+# --------------------------------------------------------------------------- #
+# Background-task registry (feeds stop_task)
+# --------------------------------------------------------------------------- #
+
+
+def _assistant_tool_use(tool_use_id, name, tool_input):
+    return {
+        "type": "assistant",
+        "message": {
+            "role": "assistant",
+            "model": "m",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": tool_use_id,
+                    "name": name,
+                    "input": tool_input,
+                }
+            ],
+        },
+    }
+
+
+def _user_tool_result(tool_use_id, text):
+    return {
+        "type": "user",
+        "message": {
+            "role": "user",
+            "content": [
+                {"type": "tool_result", "tool_use_id": tool_use_id, "content": text}
+            ],
+        },
+    }
+
+
+class TestTaskRegistry:
+    def test_bash_background_spawn_then_result_registers_task(self):
+        t = make_transport()
+        t._track_tasks(
+            _assistant_tool_use(
+                "toolu_1", "Bash", {"command": "npm run dev", "run_in_background": True}
+            )
+        )
+        assert "toolu_1" in t._pending_task_spawns
+        t._track_tasks(_user_tool_result("toolu_1", "Started. Task ID: w2tsm5ui9"))
+        # Promoted from pending to a live task keyed by the assigned task-id.
+        assert "toolu_1" not in t._pending_task_spawns
+        assert t._tasks["w2tsm5ui9"]["description"] == "npm run dev"
+        assert t._tasks["w2tsm5ui9"]["tool"] == "Bash"
+        assert t._tasks["w2tsm5ui9"]["status"] == "running"
+
+    def test_foreground_bash_is_not_a_task(self):
+        t = make_transport()
+        t._track_tasks(_assistant_tool_use("x", "Bash", {"command": "ls"}))
+        assert t._pending_task_spawns == {}
+        t._track_tasks(_user_tool_result("x", "Task ID: nope"))
+        assert t._tasks == {}
+
+    def test_agent_spawn_uses_description(self):
+        t = make_transport()
+        t._track_tasks(
+            _assistant_tool_use(
+                "toolu_a",
+                "Agent",
+                {"description": "investigate flaky test", "prompt": "go"},
+            )
+        )
+        t._track_tasks(
+            _user_tool_result("toolu_a", "Agent task started with ID: agent99")
+        )
+        assert t._tasks["agent99"]["description"] == "investigate flaky test"
+
+    def test_monitor_spawn_tracked(self):
+        t = make_transport()
+        t._track_tasks(_assistant_tool_use("m1", "Monitor", {"command": "watch build"}))
+        t._track_tasks(_user_tool_result("m1", "Monitor task started with ID: mon7"))
+        assert "mon7" in t._tasks
+
+    def test_terminal_notification_retires_task(self):
+        t = make_transport()
+        t._tasks["w2tsm5ui9"] = {
+            "tool_use_id": "toolu_1",
+            "tool": "Bash",
+            "description": "npm run dev",
+            "status": "running",
+            "output_file": None,
+        }
+        notif = (
+            "<task-notification><task-id>w2tsm5ui9</task-id>"
+            "<tool-use-id>toolu_1</tool-use-id><status>killed</status>"
+            "<output-file>/tmp/x.output</output-file><summary>stopped</summary>"
+            "</task-notification>"
+        )
+        t._track_tasks({"type": "user", "message": {"role": "user", "content": notif}})
+        assert "w2tsm5ui9" not in t._tasks
+
+    def test_running_notification_updates_without_retiring(self):
+        t = make_transport()
+        t._tasks["w2"] = {
+            "tool_use_id": "t",
+            "tool": "Bash",
+            "description": "d",
+            "status": "running",
+            "output_file": None,
+        }
+        notif = (
+            "<task-notification><task-id>w2</task-id><status>running</status>"
+            "<output-file>/tmp/o.output</output-file></task-notification>"
+        )
+        t._track_tasks({"type": "user", "message": {"role": "user", "content": notif}})
+        assert "w2" in t._tasks
+        assert t._tasks["w2"]["output_file"] == "/tmp/o.output"
+
+    def test_task_id_regex_requires_word_boundary(self):
+        # Regression (L1): "started with identifier ..." must not capture
+        # "entifier" as a task-id.
+        t = make_transport()
+        t._track_tasks(_assistant_tool_use("x", "Agent", {"description": "d"}))
+        t._track_tasks(
+            _user_tool_result("x", "Agent started with identifier; see logs")
+        )
+        assert t._tasks == {}
+        assert "x" in t._pending_task_spawns  # still pending, not bogus-registered
+
+    def test_emit_line_feeds_registry(self):
+        # The tail loop's _emit_line must drive the registry end to end.
+        async def _test():
+            t = make_transport()
+            t._out_send, t._out_recv = anyio.create_memory_object_stream(100)
+            await t._emit_line(
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "uuid": "u1",
+                        "message": {
+                            "role": "assistant",
+                            "model": "m",
+                            "content": [
+                                {
+                                    "type": "tool_use",
+                                    "id": "toolu_1",
+                                    "name": "Bash",
+                                    "input": {
+                                        "command": "sleep 100",
+                                        "run_in_background": True,
+                                    },
+                                }
+                            ],
+                        },
+                    }
+                ).encode()
+            )
+            await t._emit_line(
+                json.dumps(
+                    {
+                        "type": "user",
+                        "uuid": "u2",
+                        "message": {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "tool_result",
+                                    "tool_use_id": "toolu_1",
+                                    "content": "Task ID: bg123",
+                                }
+                            ],
+                        },
+                    }
+                ).encode()
+            )
+            return t
+
+        t = anyio.run(_test)
+        assert "bg123" in t._tasks
+
+
+# --------------------------------------------------------------------------- #
+# stop_task (drive the /tasks dialog)
+# --------------------------------------------------------------------------- #
+
+
+def _running_task(description="npm run dev"):
+    return {
+        "tool_use_id": "toolu_1",
+        "tool": "Bash",
+        "description": description,
+        "status": "running",
+        "output_file": None,
+    }
+
+
+class TestStopTask:
+    def test_unknown_task_id_errors(self):
+        async def _test():
+            t = make_transport()
+            err = await t._stop_task("nope")
+            assert err is not None
+            assert "no known" in err
+
+        anyio.run(_test)
+
+    def test_non_string_task_id_errors(self):
+        async def _test():
+            t = make_transport()
+            err = await t._stop_task(None)
+            assert err is not None and "task_id" in err
+
+        anyio.run(_test)
+
+    def test_requires_pyte(self):
+        async def _test():
+            t = make_transport()
+            t._tasks["w2"] = _running_task()
+            t._question_screen = None
+            err = await t._stop_task("w2")
+            assert err is not None and "pyte" in err
+
+        anyio.run(_test)
+
+    @staticmethod
+    def _retired_true(t):
+        async def _retired(*_a, **_k):
+            return True
+
+        t._await_task_retired = _retired  # type: ignore[method-assign]
+
+    def test_kills_matching_selected_row(self):
+        async def _test():
+            t = make_transport()
+            t._question_screen = object()  # truthy: pyte gate passes
+            t._tasks["w2"] = _running_task("npm run dev")
+            writes = _capture_pty_writes(t)
+            frame = [
+                "Background tasks",
+                "❯ Bash  npm run dev   running 2m",
+                "  Agent  research     running 1m",
+                "x to kill · esc to close",
+            ]
+            t._read_screen_lines = lambda: frame  # type: ignore[method-assign]
+            self._retired_true(t)
+
+            err = await t._stop_task("w2")
+            assert err is None
+            assert b"/tasks" in writes  # dialog opened
+            assert b"x" in writes  # kill keystroke sent
+            assert writes[-1] == _INTERRUPT  # dialog closed afterward
+
+        anyio.run(_test)
+
+    def test_does_not_kill_when_no_row_matches(self):
+        async def _test():
+            t = make_transport()
+            t._question_screen = object()
+            t._tasks["w2"] = _running_task("npm run dev")
+            writes = _capture_pty_writes(t)
+            # No row matches -> fail safe, never press x.
+            frame = [
+                "Background tasks",
+                "❯ Agent  unrelated research  running",
+                "  Workflow  other            running",
+                "esc to close · x to kill",
+            ]
+            t._read_screen_lines = lambda: frame  # type: ignore[method-assign]
+
+            err = await t._stop_task("w2")
+            assert err is not None and "could not locate" in err
+            assert b"x" not in writes  # never killed the wrong task
+
+        anyio.run(_test)
+
+    def test_ambiguous_match_refuses_to_kill(self):
+        # Regression (C2): two rows match the target -> refuse, never press x.
+        async def _test():
+            t = make_transport()
+            t._question_screen = object()
+            t._tasks["w2"] = _running_task("npm run dev")
+            writes = _capture_pty_writes(t)
+            frame = [
+                "Background tasks",
+                "❯ Bash  npm run dev   running 2m",
+                "  Bash  npm run dev   running 1m",
+                "x to kill · esc to close",
+            ]
+            t._read_screen_lines = lambda: frame  # type: ignore[method-assign]
+
+            err = await t._stop_task("w2")
+            assert err is not None and "multiple" in err
+            assert b"x" not in writes
+            assert writes[-1] == _INTERRUPT  # dialog was open -> dismissed
+
+        anyio.run(_test)
+
+    def test_navigates_to_matching_row_before_killing(self):
+        # The match is not the initially-selected row: navigation must move the
+        # caret (arrow-down) before pressing x.
+        async def _test():
+            t = make_transport()
+            t._question_screen = object()
+            t._tasks["w2"] = _running_task("npm run dev")
+            writes = _capture_pty_writes(t)
+            # Two frames: caret starts on the non-matching row, then moves.
+            frames = [
+                [
+                    "Background tasks",
+                    "❯ Agent  research     running 1m",
+                    "  Bash  npm run dev   running 2m",
+                    "x to kill · esc to close",
+                ],
+                [
+                    "Background tasks",
+                    "  Agent  research     running 1m",
+                    "❯ Bash  npm run dev   running 2m",
+                    "x to kill · esc to close",
+                ],
+            ]
+            calls = {"n": 0}
+
+            def _read():
+                # Advance to the second frame after the first arrow-down.
+                idx = min(calls["n"], len(frames) - 1)
+                return frames[idx]
+
+            def _read_screen_lines():
+                return _read()
+
+            t._read_screen_lines = _read_screen_lines  # type: ignore[method-assign]
+            orig_write = t._pty_write
+
+            async def _counting_write(data: bytes) -> None:
+                if data == pty_cli._ARROW_DOWN:
+                    calls["n"] += 1
+                await orig_write(data)
+
+            t._pty_write = _counting_write  # type: ignore[method-assign]
+            self._retired_true(t)
+
+            err = await t._stop_task("w2")
+            assert err is None
+            assert pty_cli._ARROW_DOWN in writes  # had to navigate
+            assert b"x" in writes
+
+        anyio.run(_test)
+
+    def test_kill_without_confirmation_reports_error(self):
+        # Regression (H3): if the task never leaves the registry (no observed
+        # termination), stop_task reports an error, not a false success.
+        async def _test():
+            t = make_transport()
+            t._question_screen = object()
+            t._tasks["w2"] = _running_task("npm run dev")
+            _capture_pty_writes(t)
+            frame = [
+                "Background tasks",
+                "❯ Bash  npm run dev   running 2m",
+                "x to kill · esc to close",
+            ]
+            t._read_screen_lines = lambda: frame  # type: ignore[method-assign]
+
+            async def _not_retired(*_a, **_k):
+                return False
+
+            t._await_task_retired = _not_retired  # type: ignore[method-assign]
+
+            err = await t._stop_task("w2")
+            assert err is not None and "did not observe it terminate" in err
+
+        anyio.run(_test)
+
+    def test_dialog_failing_to_open_does_not_send_esc(self):
+        # Regression (M1): when /tasks doesn't render a dialog, do NOT send ESC
+        # (it would interrupt an in-flight turn).
+        async def _test():
+            t = make_transport()
+            t._question_screen = object()
+            t._tasks["w2"] = _running_task()
+            writes = _capture_pty_writes(t)
+
+            async def _none(*_a, **_k):
+                return None
+
+            t._await_tasks_dialog = _none  # type: ignore[method-assign]
+
+            err = await t._stop_task("w2")
+            assert err is not None and "could not open" in err
+            assert _INTERRUPT not in writes  # must NOT interrupt a possible turn
+
+        anyio.run(_test)

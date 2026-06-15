@@ -15,6 +15,9 @@ from claude_agent_sdk._internal.transport.pty_question import (
     QuestionOption,
     choose_option,
     parse_question,
+    parse_tasks_dialog,
+    task_label_key,
+    task_row_matches,
 )
 
 WRITE_FRAME = [
@@ -272,3 +275,119 @@ def test_choose_option_allow_persist_falls_back_to_once() -> None:
     )
     chosen = choose_option(q, "allow_persist")
     assert chosen is not None and chosen.index == 1
+
+
+# --------------------------------------------------------------------------- #
+# /tasks BackgroundTasksDialog parsing (drives stop_task)
+# --------------------------------------------------------------------------- #
+
+# A plausible reconstruction of the dialog. The exact layout is an undocumented
+# TUI contract -- if row identification regresses against the bundled CLI,
+# recapture this fixture from a live frame and update parse_tasks_dialog.
+TASKS_FRAME = [
+    "Background tasks",
+    "─" * 60,
+    "❯ Bash  npm run dev                       running   2m",
+    "  Agent  investigate flaky test           running   1m",
+    "  Monitor  watch build output             running   30s",
+    "─" * 60,
+    "x to kill · enter for details · esc to close",
+]
+
+
+def test_parse_tasks_dialog_returns_rows_with_selection() -> None:
+    rows = parse_tasks_dialog(TASKS_FRAME)
+    assert rows is not None
+    assert [r.selected for r in rows] == [True, False, False]
+    assert rows[0].label.startswith("Bash")
+    assert "investigate flaky test" in rows[1].label
+    # Title, separators and footer chrome are not rows.
+    assert len(rows) == 3
+
+
+def test_parse_tasks_dialog_skips_non_dialog_screens() -> None:
+    # An ordinary numbered list with no tasks chrome is not the dialog.
+    assert parse_tasks_dialog(["Here are steps:", "1. do a", "2. do b"]) is None
+    # A permission dialog (different chrome) is also not the tasks dialog.
+    assert parse_tasks_dialog(WRITE_FRAME) is None
+
+
+def test_parse_tasks_dialog_ignores_generation_output_mentioning_kill() -> None:
+    # Regression (C1): ordinary model output that mentions "kill" and ends with
+    # the turn's "esc to interrupt" footer -- including a markdown `>` quote --
+    # must NOT be detected as the tasks dialog (detection is gated on the
+    # dialog-specific "x to kill"/"x to stop" footer affordance).
+    frame = [
+        "● I'll now kill the stuck server and restart it.",
+        "> kill the dev server gracefully",
+        "1. stop process",
+        "esc to interrupt",
+    ]
+    assert parse_tasks_dialog(frame) is None
+
+
+def test_parse_tasks_dialog_strips_leading_index() -> None:
+    frame = [
+        "Background tasks",
+        "❯ 1. Bash  long running job",
+        "  2. Agent  some research",
+        "esc to close · x to kill",
+    ]
+    rows = parse_tasks_dialog(frame)
+    assert rows is not None
+    assert rows[0].label.startswith("Bash")
+    assert rows[1].label.startswith("Agent")
+
+
+def test_parse_tasks_dialog_keeps_rows_whose_command_contains_esc() -> None:
+    # Regression (H1): a task row whose command merely contains "esc"
+    # (escape/describe/rescue) must not be dropped as footer chrome.
+    frame = [
+        "Background tasks",
+        "❯ Bash  ./escape.sh --force        running",
+        "  Agent  Describe the architecture  running",
+        "x to stop · esc to close",
+    ]
+    rows = parse_tasks_dialog(frame)
+    assert rows is not None
+    assert len(rows) == 2
+    assert rows[0].label.startswith("Bash  ./escape.sh")
+    assert "Describe the architecture" in rows[1].label
+
+
+def test_task_row_matches_tolerates_prefix_and_suffix() -> None:
+    # The row carries a tool prefix + trailing status columns; the full command
+    # appears verbatim -> match.
+    assert task_row_matches("Bash  npm run dev   running 2m", "npm run dev")
+    # Truncated long command -> long shared-prefix match (after tool label).
+    assert task_row_matches(
+        "Bash  python train.py --epochs…", "python train.py --epochs 100 --lr 0.01"
+    )
+    # Unrelated row -> no match (so stop_task fails safe instead of mis-killing).
+    assert not task_row_matches("Agent  unrelated research", "npm run dev")
+    # Empty target never matches.
+    assert not task_row_matches("Bash  something", "")
+
+
+def test_task_row_matches_discriminates_sibling_commands() -> None:
+    # Regression (C2): sibling commands sharing a long prefix must NOT match the
+    # wrong one -- the full distinguishing target must appear in the row.
+    assert not task_row_matches(
+        "Bash  npm run build:staging  running", "npm run build:prod"
+    )
+    assert task_row_matches("Bash  npm run build:prod  running", "npm run build:prod")
+    # A short shared prefix on a truncated sibling must not match either.
+    assert not task_row_matches("Bash  npm run build:…", "npm run build:prod")
+    # Near-identical descriptions differing only at the tail.
+    assert not task_row_matches(
+        "Agent  Refactor the authentication flow",
+        "Refactor the authentication module",
+    )
+
+
+def test_task_label_key_strips_status_and_age() -> None:
+    # Regression (H2): the volatile status/age column is stripped, so a ticking
+    # age cannot make a static row look like it changed.
+    assert task_label_key("Bash  npm run dev   running 2m") == "bash npm run dev"
+    assert task_label_key("Bash  npm run dev   running 31s") == "bash npm run dev"
+    assert task_label_key("Agent  do a thing  killed") == "agent do a thing"
