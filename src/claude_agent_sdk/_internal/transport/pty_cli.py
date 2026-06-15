@@ -87,8 +87,12 @@ from .pty_question import (
     SCREEN_ROWS,
     DetectedQuestion,
     QuestionOption,
+    TaskDialogRow,
     choose_option,
     parse_question,
+    parse_tasks_dialog,
+    task_label_key,
+    task_row_matches,
 )
 
 logger = logging.getLogger(__name__)
@@ -129,6 +133,12 @@ _SKIP_TRANSCRIPT_TYPES = frozenset(
 _SUBMIT = b"\r"
 _INTERRUPT = b"\x1b"
 _SHIFT_TAB = b"\x1b[Z"
+# Down-arrow moves the selection in list dialogs; ``x`` kills the selected task
+# in the /tasks BackgroundTasksDialog (no confirmation). ESC closes the dialog
+# (it is also the turn-interrupt key, so it is only sent to dismiss a dialog we
+# opened).
+_ARROW_DOWN = b"\x1b[B"
+_KILL_TASK = b"x"
 
 # Bracketed-paste guards. Wrapping the prompt in these makes the TUI insert the
 # text verbatim into the editor -- preserving newlines and NOT interpreting a
@@ -154,8 +164,11 @@ _SEEN_UUIDS_MAX = 2_048
 
 # Background-task tracking. Tools that spawn work which outlives the turn that
 # started it. ``Bash`` only spawns a background task when its
-# ``run_in_background`` input is set, so it is matched separately.
-_BACKGROUND_TASK_TOOLS = frozenset({"Monitor", "Agent", "Workflow"})
+# ``run_in_background`` input is set, so it is matched separately. ``Agent``
+# /``Task`` cover the sub-agent tool under either name the CLI version uses.
+# Shared by the turn-hold tracker AND the stop_task spawn detector
+# (``_is_task_spawn``).
+_BACKGROUND_TASK_TOOLS = frozenset({"Monitor", "Agent", "Task", "Workflow"})
 
 # Terminal <status> values in a <task-notification>: once a task reports one of
 # these it is done and stops holding the turn open. ``pending``/``running`` are
@@ -180,6 +193,74 @@ _BACKGROUND_TASK_WAIT_CAP_SECS = 3600.0
 # Order the TUI cycles through on shift+tab. bypassPermissions is not part of
 # the cycle (it is only reachable via launch flag), so it cannot be set live.
 _PERMISSION_CYCLE = ("default", "acceptEdits", "plan")
+
+# The short task-id the CLI assigns (used by stop_task to identify a task) is
+# reported in the spawning tool's RESULT text (not its input), with tool-specific
+# phrasing -- e.g. "Task ID: w2tsm5ui9" or "Monitor task started with ID: ...".
+# This matches the id token after either phrasing (lower/upper, optional
+# backticks). The <task-notification> regex + terminal-status set are shared with
+# the turn-hold tracker above.
+_TASK_ID_RE = re.compile(
+    r"(?:task\s+id|started\s+with\s+id)\b\s*[:=]?\s*`?([A-Za-z0-9][A-Za-z0-9_-]{2,})`?",
+    re.IGNORECASE,
+)
+
+# Upper bound on tracked tasks / pending spawns so a long session cannot grow
+# either dict without limit (a backgrounded tool whose result never yields a
+# task-id, or a task that completes without a terminal notification, would
+# otherwise leak). Oldest entries are evicted first.
+_MAX_TRACKED_TASKS = 256
+
+# Upper bound on keystroke iterations while navigating the tasks dialog, so a
+# misparsed/never-matching dialog can never loop unbounded.
+_MAX_TASK_NAV_STEPS = 64
+
+
+def _xml_tag(block: str, tag: str) -> str | None:
+    """Return the trimmed text of ``<tag>...</tag>`` within ``block``, or None."""
+    m = re.search(rf"<{tag}>(.*?)</{tag}>", block, re.DOTALL)
+    return m.group(1).strip() if m else None
+
+
+def _bound_dict(d: dict[str, Any], max_size: int) -> None:
+    """Evict oldest insertion-ordered entries until ``d`` fits ``max_size``."""
+    while len(d) > max_size:
+        d.pop(next(iter(d)))
+
+
+def _is_task_spawn(name: str, tool_input: dict[str, Any]) -> bool:
+    """True if a tool_use of ``name`` with ``tool_input`` spawns a background task."""
+    if name in _BACKGROUND_TASK_TOOLS:
+        return True
+    # Bash is only a background task when explicitly backgrounded.
+    return name == "Bash" and bool(tool_input.get("run_in_background"))
+
+
+def _task_description(name: str, tool_input: dict[str, Any]) -> str:
+    """Best-effort human description for a spawned task, for dialog row matching.
+
+    Mirrors what the TUI renders per task type: a Bash/Monitor task shows its
+    command; an Agent/Workflow task shows its description/prompt. Falls back to
+    the first string-valued input so a row is still matchable.
+    """
+    if name in ("Bash", "Monitor"):
+        candidate = tool_input.get("command") or tool_input.get("description")
+    elif name in ("Agent", "Task"):
+        candidate = tool_input.get("description") or tool_input.get("prompt")
+    elif name == "Workflow":
+        candidate = (
+            tool_input.get("description")
+            or tool_input.get("name")
+            or tool_input.get("workflow")
+        )
+    else:
+        candidate = None
+    if isinstance(candidate, str) and candidate.strip():
+        return candidate.strip()
+    for value in tool_input.values():
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
 
 
 def _translate_transcript_entry(
@@ -489,6 +570,21 @@ class PtyCLITransport(Transport):
         # approximate the current context window occupancy.
         self._latest_context_usage: dict[str, Any] | None = None
         self._latest_context_model: str | None = None
+
+        # ----- Background-task registry (stop_task) --------------------- #
+        # The interactive transport has NO list-tasks control channel, so the
+        # set of live background tasks and their ids is reconstructed from the
+        # transcript (see _track_tasks): a spawning tool_use, then the
+        # tool_result that carries the assigned task-id, then a
+        # ``<task-notification>`` whose terminal status retires the task. This
+        # registry is what stop_task(task_id) consults to identify which row to
+        # kill in the /tasks dialog. Keyed by task_id ->
+        # {"tool_use_id", "tool", "description", "status", "output_file"}.
+        self._tasks: dict[str, dict[str, Any]] = {}
+        # Spawn tool_use blocks awaiting their task-id (the id arrives later, in
+        # the tool_result TEXT, not the tool_use input). tool_use_id ->
+        # {"tool", "description"}.
+        self._pending_task_spawns: dict[str, dict[str, Any]] = {}
 
         # ----- Hook IPC bridge (win #3) --------------------------------- #
         # When the caller configures programmatic ``options.hooks`` and/or
@@ -2002,9 +2098,14 @@ class PtyCLITransport(Transport):
             while len(self._seen_uuids) > _SEEN_UUIDS_MAX:
                 self._seen_uuids.popitem(last=False)
 
-        # Track background tasks (spawn tool_use / terminal task-notification) so
-        # the turn can be held open past turn_duration until they finish.
+        # Track background tasks (spawn tool_use / terminal task-notification)
+        # so the turn can be held open past turn_duration until they finish
+        # (the hold), AND maintain the stop_task registry (task_id ->
+        # description/status) so stop_task can identify which task to kill.
+        # Best-effort: a malformed record must never break tailing.
         self._track_background_tasks(entry)
+        with contextlib.suppress(Exception):
+            self._track_tasks(entry)
 
         # turn_duration is the turn-complete signal -> synthesize a result that
         # carries the turn's final text, accumulated usage, and error state.
@@ -2047,6 +2148,142 @@ class PtyCLITransport(Transport):
             and _has_tool_result(message.get("message"))
         ):
             await self._emit_deny_result(entry)
+
+    # ------------------------------------------------------------------ #
+    # Background-task registry (feeds stop_task)
+    # ------------------------------------------------------------------ #
+
+    def _track_tasks(self, entry: dict[str, Any]) -> None:
+        """Update the live background-task registry from one transcript record.
+
+        Three record shapes drive it (all verified against real transcripts):
+
+        * an assistant ``tool_use`` for a spawning tool -> remember it pending
+          (the assigned task-id is not in the input yet);
+        * a user ``tool_result`` for that tool_use whose TEXT carries the
+          task-id -> promote it to a live task keyed by task-id;
+        * a user ``<task-notification>`` -> update status, and retire the task
+          on a terminal status (completed/failed/killed).
+        """
+        etype = entry.get("type")
+        message = entry.get("message")
+        if not isinstance(message, dict):
+            return
+        content = message.get("content")
+
+        if etype == "assistant":
+            if not isinstance(content, list):
+                return
+            for block in content:
+                if not isinstance(block, dict) or block.get("type") != "tool_use":
+                    continue
+                name = block.get("name")
+                tool_use_id = block.get("id")
+                inp = block.get("input")
+                inp = inp if isinstance(inp, dict) else {}
+                if not isinstance(name, str) or not isinstance(tool_use_id, str):
+                    continue
+                if not _is_task_spawn(name, inp):
+                    continue
+                self._pending_task_spawns[tool_use_id] = {
+                    "tool": name,
+                    "description": _task_description(name, inp),
+                }
+                _bound_dict(self._pending_task_spawns, _MAX_TRACKED_TASKS)
+            return
+
+        if etype != "user":
+            return
+
+        # A <task-notification> record (string- or text-block content) reports
+        # lifecycle for an existing task.
+        text = self._user_record_text(content)
+        if "<task-notification>" in text:
+            self._apply_task_notifications(text)
+
+        # A spawning tool's result text carries the freshly assigned task-id.
+        if isinstance(content, list):
+            for block in content:
+                if not isinstance(block, dict) or block.get("type") != "tool_result":
+                    continue
+                tool_use_id = block.get("tool_use_id")
+                if tool_use_id not in self._pending_task_spawns:
+                    continue
+                m = _TASK_ID_RE.search(self._block_text(block.get("content")))
+                if not m:
+                    continue
+                task_id = m.group(1)
+                meta = self._pending_task_spawns.pop(tool_use_id)
+                self._tasks[task_id] = {
+                    "tool_use_id": tool_use_id,
+                    "tool": meta["tool"],
+                    "description": meta["description"],
+                    "status": "running",
+                    "output_file": None,
+                }
+                _bound_dict(self._tasks, _MAX_TRACKED_TASKS)
+
+    def _apply_task_notifications(self, text: str) -> None:
+        """Update/retire tasks from one or more ``<task-notification>`` blocks."""
+        for block in _TASK_NOTIFICATION_RE.findall(text):
+            task_id = _xml_tag(block, "task-id")
+            if not task_id:
+                continue
+            status = (_xml_tag(block, "status") or "").lower()
+            if status in _TERMINAL_TASK_STATUSES:
+                self._tasks.pop(task_id, None)
+                continue
+            task = self._tasks.get(task_id)
+            if task is None:
+                # A notification for a task whose spawn we missed (e.g. a
+                # resumed session): register it so it is still stoppable. The
+                # <summary> is a status sentence, not the command the dialog
+                # renders, so such a task may not be locatable by description --
+                # we still register it so the registry reflects it.
+                task = self._tasks.setdefault(
+                    task_id,
+                    {
+                        "tool_use_id": _xml_tag(block, "tool-use-id"),
+                        "tool": None,
+                        "description": _xml_tag(block, "summary") or "",
+                        "status": status or "running",
+                        "output_file": None,
+                    },
+                )
+                _bound_dict(self._tasks, _MAX_TRACKED_TASKS)
+            if status:
+                task["status"] = status
+            output_file = _xml_tag(block, "output-file")
+            if output_file:
+                task["output_file"] = output_file
+
+    @staticmethod
+    def _user_record_text(content: Any) -> str:
+        """Flatten a user record's content to text (string or text blocks)."""
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts: list[str] = []
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    parts.append(str(block.get("text", "")))
+            return "\n".join(parts)
+        return ""
+
+    @staticmethod
+    def _block_text(content: Any) -> str:
+        """Flatten a tool_result's content (string or list of text blocks)."""
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts: list[str] = []
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    parts.append(str(block.get("text", "")))
+                elif isinstance(block, str):
+                    parts.append(block)
+            return "\n".join(parts)
+        return ""
 
     async def _handle_assistant(self, message: dict[str, Any]) -> None:
         """Emit one assistant block-record as its own AssistantMessage (RV1).
@@ -2594,6 +2831,7 @@ class PtyCLITransport(Transport):
             "set_model",
             "mcp_status",
             "get_context_usage",
+            "stop_task",
         }
     )
 
@@ -2601,10 +2839,11 @@ class PtyCLITransport(Transport):
         """Map an SDK control request to its interactive-TUI equivalent.
 
         Supported: ``initialize`` (local ack), ``interrupt`` (ESC),
-        ``set_permission_mode`` (shift+tab cycling), ``set_model`` (``/model``).
-        Everything else (mcp_status, get_context_usage, mcp_reconnect,
-        mcp_toggle, stop_task, rewind_files, ...) has no interactive channel
-        that returns data, so it gets an explicit error control_response.
+        ``set_permission_mode`` (shift+tab cycling), ``set_model`` (``/model``),
+        ``mcp_status`` / ``get_context_usage`` (from observed state), and
+        ``stop_task`` (drives the ``/tasks`` dialog). Everything else
+        (mcp_reconnect, mcp_toggle, rewind_files, ...) has no interactive
+        channel, so it gets an explicit error control_response.
         """
         request = obj.get("request", {})
         subtype = request.get("subtype")
@@ -2633,6 +2872,8 @@ class PtyCLITransport(Transport):
                 payload = self._mcp_status_payload()
             elif subtype == "get_context_usage":
                 payload = self._context_usage_payload()
+            elif subtype == "stop_task":
+                error = await self._stop_task(request.get("task_id"))
             elif subtype not in self._SUPPORTED_CONTROLS:
                 error = (
                     f"control request '{subtype}' is not supported by the "
@@ -2793,6 +3034,139 @@ class PtyCLITransport(Transport):
             await self._pty_write(command.encode("utf-8"))
             await anyio.sleep(0.2)
             await self._pty_write(_SUBMIT)
+
+    # ------------------------------------------------------------------ #
+    # stop_task (drive the /tasks BackgroundTasksDialog)
+    # ------------------------------------------------------------------ #
+
+    async def _stop_task(self, task_id: Any) -> str | None:
+        """Stop the background task ``task_id`` via the ``/tasks`` dialog.
+
+        The interactive transport has no machine channel to stop a task, so it
+        opens the TUI's BackgroundTasksDialog, navigates to the row matching the
+        task's description, and presses ``x``. Returns ``None`` on success or an
+        error string. The kill keystroke is only sent once the parsed
+        *selected* row positively matches the target description, so a layout
+        drift fails safe ("could not locate ...") rather than killing the wrong
+        task.
+        """
+        if not isinstance(task_id, str) or not task_id:
+            return "stop_task requires a string 'task_id'"
+        task = self._tasks.get(task_id)
+        if task is None:
+            known = ", ".join(sorted(self._tasks)) or "none"
+            return (
+                f"no known running background task with id {task_id!r} "
+                f"(known running tasks: {known}). The interactive transport can "
+                "only stop tasks observed spawning in the session transcript."
+            )
+        if self._question_screen is None:
+            return (
+                "stop_task needs the optional 'pyte' dependency to read the "
+                "tasks dialog; install claude-agent-sdk[pty-introspect]."
+            )
+
+        description = task.get("description") or ""
+        await self._warmup()
+        async with self._write_lock:
+            # Open the dialog.
+            await self._pty_write(b"/tasks")
+            await anyio.sleep(0.2)
+            await self._pty_write(_SUBMIT)
+            rows = await self._await_tasks_dialog()
+            if rows is None:
+                # The dialog did not render. Do NOT send ESC here: if a turn is
+                # in flight, ESC would interrupt it -- and with no confirmed
+                # dialog there is nothing to dismiss.
+                return f"could not open or parse the /tasks dialog to stop {task_id!r}"
+            outcome = await self._navigate_and_kill(description)
+            # A dialog was confirmed open, so ESC dismisses it (not a turn).
+            await self._pty_write(_INTERRUPT)
+
+        if outcome == "ambiguous":
+            return (
+                f"multiple background tasks in the /tasks dialog match "
+                f"{description!r}; refusing to stop {task_id!r} to avoid killing "
+                "the wrong task"
+            )
+        if outcome != "killed":
+            return (
+                f"could not locate task {task_id!r} ({description!r}) in the "
+                "tasks dialog to stop it"
+            )
+        # Confirm the kill: the killed <task-notification> retires the task from
+        # the registry (processed by the concurrent tail loop). The write lock is
+        # released here so tailing is not starved. If we never observe it, report
+        # an error rather than a false success.
+        if not await self._await_task_retired(task_id):
+            return (
+                f"sent the stop keystroke for task {task_id!r} but did not "
+                "observe it terminate; it may still be running"
+            )
+        return None
+
+    def _read_screen_lines(self) -> list[str]:
+        """Snapshot the emulated TUI screen as rstripped lines (or [] w/o pyte)."""
+        screen = self._question_screen
+        if screen is None:
+            return []
+        return [line.rstrip() for line in screen.display]
+
+    async def _await_tasks_dialog(
+        self, timeout: float = 2.0
+    ) -> list[TaskDialogRow] | None:
+        """Poll the screen until the tasks dialog renders. Returns rows or None."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            rows = parse_tasks_dialog(self._read_screen_lines())
+            if rows is not None:
+                return rows
+            await anyio.sleep(0.1)
+        return parse_tasks_dialog(self._read_screen_lines())
+
+    async def _navigate_and_kill(self, description: str) -> str:
+        """Navigate to the uniquely-matching row and press ``x``.
+
+        Returns ``"killed"``, ``"ambiguous"`` (more than one row matches -- never
+        kill), or ``"not_found"``. The kill keystroke is sent only when the
+        *selected* row matches AND exactly one row in the current frame matches,
+        so neither a layout drift nor sibling commands cause the wrong task to be
+        killed. The wrap-around guard hashes a status/age-stripped row key
+        (``task_label_key``) so a live-updating age column cannot defeat it.
+        """
+        seen: set[tuple[tuple[bool, str], ...]] = set()
+        for _ in range(_MAX_TASK_NAV_STEPS):
+            rows = parse_tasks_dialog(self._read_screen_lines())
+            if not rows:
+                return "not_found"
+            match_count = sum(task_row_matches(r.label, description) for r in rows)
+            if match_count == 0:
+                return "not_found"
+            if match_count > 1:
+                return "ambiguous"
+            selected = next((r for r in rows if r.selected), None)
+            if selected is None:
+                return "not_found"
+            if task_row_matches(selected.label, description):
+                await self._pty_write(_KILL_TASK)
+                await anyio.sleep(0.1)
+                return "killed"
+            signature = tuple((r.selected, task_label_key(r.label)) for r in rows)
+            if signature in seen:
+                return "not_found"  # selection wrapped without reaching the row
+            seen.add(signature)
+            await self._pty_write(_ARROW_DOWN)
+            await anyio.sleep(0.1)
+        return "not_found"
+
+    async def _await_task_retired(self, task_id: str, timeout: float = 3.0) -> bool:
+        """Return True once the killed task leaves the live registry, else False."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if task_id not in self._tasks:
+                return True
+            await anyio.sleep(0.1)
+        return task_id not in self._tasks
 
     async def _handle_user_message(self, obj: dict[str, Any]) -> None:
         message = obj.get("message", {})

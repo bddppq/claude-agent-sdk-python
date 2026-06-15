@@ -308,6 +308,177 @@ def parse_question(lines: list[str]) -> DetectedQuestion | None:
     )
 
 
+@dataclass
+class TaskDialogRow:
+    """One task row rendered in the ``/tasks`` BackgroundTasksDialog.
+
+    ``label`` is the visible description/command text (tool prefix and trailing
+    status/age columns included, normalized only by whitespace collapse).
+    ``selected`` is True for the row currently bearing the navigation caret --
+    the row a subsequent ``x`` keypress would kill.
+    """
+
+    label: str
+    selected: bool
+
+
+# Footer/navigation chrome lines that are NOT task rows. Matched as substrings
+# of a whitespace-stripped, lowercased line. These are dialog-specific phrases
+# (not bare words like "esc"), so a task row whose command merely CONTAINS
+# "esc"/"kill" (e.g. ``./escape.sh``) is not wrongly dropped. NOTE: the dialog
+# layout is an undocumented TUI contract that can shift between CLI versions --
+# re-verify against the bundled CLI and update the fixtures in
+# test_pty_question.py if row identification regresses.
+_TASKS_ROW_CHROME = (
+    "escto",  # "esc to close" / "esc to cancel" / "esc to exit"
+    "xtokill",
+    "xtostop",
+    "tab/arrow",
+    "arrowkeys",
+    "enterfordetails",
+    "entertoselect",
+    "entertoview",
+)
+
+# The kill/stop affordance is the dialog-specific footer that gates detection.
+# Ordinary model output does not render "x to kill" / "x to stop" as chrome, so
+# gating on it (rather than loose words like "kill"+"esc") prevents misdetecting
+# generation output -- including markdown blockquotes -- as the tasks dialog.
+_TASKS_DIALOG_ANCHORS = ("xtokill", "xtostop")
+
+# Trailing status/age columns rendered after a task's description. They update
+# live (e.g. the age ticks "30s" -> "31s"), so they are stripped before matching
+# and before computing a navigation signature -- otherwise a changing age would
+# make every screen read look "new" and defeat the wrap-around loop guard.
+_TASK_STATUS_TOKENS = frozenset(
+    {
+        "running",
+        "completed",
+        "complete",
+        "failed",
+        "failure",
+        "killed",
+        "pending",
+        "queued",
+        "done",
+        "stopped",
+        "success",
+        "succeeded",
+        "error",
+    }
+)
+_AGE_RE = re.compile(r"^\d+(?:\.\d+)?[smhdw]$")
+_TASK_TOOL_PREFIXES = ("bash ", "agent ", "task ", "workflow ", "monitor ")
+
+
+def parse_tasks_dialog(lines: list[str]) -> list[TaskDialogRow] | None:
+    """Parse the ``/tasks`` BackgroundTasksDialog into its task rows, or None.
+
+    Returns ``None`` when the screen is not showing the tasks dialog. Detection
+    is gated on the dialog's kill/stop FOOTER affordance (``x to kill`` /
+    ``x to stop``), which ordinary model output never renders, so generation
+    output -- even text mentioning "kill" with an "esc to interrupt" footer, or
+    a markdown ``>`` blockquote -- is not misdetected as the dialog (and its
+    ``>`` lines are not mistaken for a selection caret).
+
+    Best-effort by design: callers must NOT act (press ``x``) unless a single
+    clearly-selected row positively matches the intended task, so a layout drift
+    degrades to "could not locate the task" rather than killing the wrong one.
+    """
+    normalized = _normalize(lines)
+    if not any(anchor in normalized for anchor in _TASKS_DIALOG_ANCHORS):
+        return None
+
+    rows: list[TaskDialogRow] = []
+    title_skipped = False
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        low = re.sub(r"\s+", "", stripped).lower()
+        # The dialog title ("Background tasks") leads the list; skip it once.
+        if not title_skipped and "background" in low and "task" in low:
+            title_skipped = True
+            continue
+        # Skip box-drawing separators and footer/navigation chrome.
+        if set(stripped) <= set("─╌│ ·—-"):
+            continue
+        if any(anchor in low for anchor in _TASKS_ROW_CHROME):
+            continue
+        selected = stripped[0] in ("❯", ">")
+        label = stripped[1:].strip() if selected else stripped
+        # A leading "1." / "1)" index, when present, is navigation chrome.
+        label = re.sub(r"^\d+[.)]\s*", "", label).strip()
+        if label:
+            rows.append(TaskDialogRow(label=label, selected=selected))
+    return rows or None
+
+
+def _normalize_task_text(text: str | None) -> str:
+    """Whitespace-collapsed, lowercased form for task description matching."""
+    return re.sub(r"\s+", " ", text or "").strip().lower()
+
+
+def _strip_status_columns(label: str) -> str:
+    """Drop trailing status/age tokens (e.g. ``running 2m``) from a row label."""
+    tokens = label.split()
+    while tokens:
+        last = tokens[-1].lower().strip("·.")
+        if last in _TASK_STATUS_TOKENS or _AGE_RE.match(last):
+            tokens.pop()
+        else:
+            break
+    return " ".join(tokens)
+
+
+def task_label_key(label: str) -> str:
+    """Stable identity for a dialog row: normalized, status/age columns removed.
+
+    Used both for matching and for the navigation-loop wrap-around signature, so
+    a live-updating age column cannot make a static row look like it changed.
+    """
+    return _strip_status_columns(_normalize_task_text(label))
+
+
+def _strip_leading_tool(text: str) -> str:
+    """Strip a single leading tool label (``bash ``/``agent ``/...) if present."""
+    for prefix in _TASK_TOOL_PREFIXES:
+        if text.startswith(prefix):
+            return text[len(prefix) :]
+    return text
+
+
+def task_row_matches(row_label: str, target_description: str) -> bool:
+    """True if a dialog row refers to the task with ``target_description``.
+
+    Matching is deliberately strict so it discriminates *sibling* commands
+    (e.g. ``npm run build:prod`` vs ``npm run build:staging``) and never kills
+    the wrong task:
+
+    * the FULL target must appear verbatim in the row's description (after
+      stripping the live status/age columns) -- so a longer sibling that merely
+      shares a prefix does not match; OR
+    * for a row truncated with an ellipsis, the visible stem (minus an optional
+      leading tool label) must be a long-enough PREFIX of the target.
+
+    Ambiguity (two rows matching) is rejected by the caller, not here.
+    """
+    target = _normalize_task_text(target_description)
+    if not target:
+        return False
+    stripped = task_label_key(row_label)
+    if not stripped:
+        return False
+    # Verbatim containment of the full target -> unambiguous match.
+    if target in stripped:
+        return True
+    # Truncated row: require a long shared prefix (after the tool label) so a
+    # short shared prefix between siblings cannot match.
+    truncated = stripped.endswith("…") or stripped.endswith("...")
+    stem = _strip_leading_tool(stripped.rstrip("… ."))
+    return truncated and len(stem) >= 16 and target.startswith(stem)
+
+
 def choose_option(
     question: DetectedQuestion, want: Literal["allow", "allow_persist", "deny"]
 ) -> QuestionOption | None:
